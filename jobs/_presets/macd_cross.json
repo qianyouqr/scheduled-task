@@ -1,0 +1,29 @@
+{
+  "id": "",
+  "name": "MACD 金叉",
+  "enabled": true,
+  "description": "DIF 上穿 DEA（昨日 DIF<DEA 且今日 DIF>=DEA）",
+  "asset_source": {"type": "inline", "assets": [], "disabled_tickers": []},
+  "signal": {
+    "category": {"direction": "buy", "label": "金叉", "description": "MACD DIF 上穿 DEA"},
+    "formulas": [
+      {"name": "资产池收盘价", "expression": "资产池构造({ASSETS}) * \"全市场每日收盘价\""},
+      {"name": "EMA12",        "expression": "EMA(\"资产池收盘价\", 12)"},
+      {"name": "EMA26",        "expression": "EMA(\"资产池收盘价\", 26)"},
+      {"name": "DIF",          "expression": "\"EMA12\" - \"EMA26\""},
+      {"name": "DEA",          "expression": "EMA(\"DIF\", 9)"},
+      {"name": "信号",         "expression": "(\"DIF\" > \"DEA\") AND (NDay(\"DIF\", 1) <= NDay(\"DEA\", 1))"}
+    ],
+    "trigger_formula": "信号",
+    "display_fields": ["DIF", "DEA"],
+    "lookback_days": 90
+  },
+  "cooldown_days": 5,
+  "analysis_hook": {"enabled": false, "framework_doc": "", "websearch_template": {}, "output_sections": []},
+  "notification": {
+    "wecom": {"enabled": true, "webhook": "", "mentioned_list": [], "mentioned_mobile_list": []},
+    "push_when": "triggered_only"
+  },
+  "schedule": {"enabled": true, "time": "16:00", "cron": null, "task_name": ""},
+  "report": {"template_path": "../../templates/default_report.md", "output_dir": "output/reports"}
+}

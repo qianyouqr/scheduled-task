@@ -1,0 +1,36 @@
+{
+  "id": "",
+  "name": "MA60 - 2σ 中线抄底跟踪（R4B）",
+  "enabled": true,
+  "description": "收盘价 < MA60 - 2*STD60 时触发（R4B 稳健版信号，60 日布林下轨，假信号少，适合中线底部埋伏）",
+  "asset_source": {"type": "inline", "assets": [], "disabled_tickers": []},
+  "signal": {
+    "category": {"direction": "buy", "label": "中线抄底", "description": "60 日布林下轨跌破，假信号少"},
+    "formulas": [
+      {"name": "资产池收盘价", "expression": "资产池构造({ASSETS}) * \"全市场每日收盘价\""},
+      {"name": "MA60",         "expression": "平均(\"资产池收盘价\", 60)"},
+      {"name": "下轨60",       "expression": "\"MA60\" - 2 * 标准差(\"资产池收盘价\", 60)"},
+      {"name": "信号",         "expression": "\"资产池收盘价\" < \"下轨60\""}
+    ],
+    "trigger_formula": "信号",
+    "display_fields": ["资产池收盘价", "MA60", "下轨60"],
+    "lookback_days": 120
+  },
+  "cooldown_days": 14,
+  "analysis_hook": {
+    "enabled": false,
+    "framework_doc": "",
+    "websearch_template": {
+      "A": "{company} 近期下跌 原因",
+      "HK": "{company} 下跌",
+      "US": "{ticker} selloff reasons"
+    },
+    "output_sections": ["下跌归因", "框架分类", "抄底结论"]
+  },
+  "notification": {
+    "wecom": {"enabled": true, "webhook": "", "mentioned_list": [], "mentioned_mobile_list": []},
+    "push_when": "triggered_only"
+  },
+  "schedule": {"enabled": true, "time": "08:30", "cron": null, "task_name": ""},
+  "report": {"template_path": "../../templates/default_report.md", "output_dir": "output/reports"}
+}

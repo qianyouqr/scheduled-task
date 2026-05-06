@@ -1,0 +1,47 @@
+{
+  "id": "_preset_",
+  "name": "低PE高股息 Top10",
+  "task_type": "stock_picker",
+  "enabled": true,
+  "formulas": [
+    "条件掩码 = 板块(万得全A) * (\"A股市盈率（PE, TTM）〔估值数据〕\"<15) * (\"A股股息率〔估值数据〕\">3)",
+    "排序值 = \"条件掩码\" * \"A股股息率〔估值数据〕\"",
+    "Top10股息率 = 取前(\"排序值\", 10, 返回数值)",
+    "Top10PE = 取前(\"排序值\", 10) * \"A股市盈率（PE, TTM）〔估值数据〕\""
+  ],
+  "result_handler": {
+    "mode": "topn_by_mask",
+    "result_formula": "Top10股息率",
+    "value_columns": [
+      {"label": "股息率(%)", "from": "Top10股息率", "format": "{:.2f}"},
+      {"label": "PE(TTM)", "from": "Top10PE", "format": "{:.2f}"}
+    ],
+    "sort_by": "股息率(%)",
+    "sort_order": "desc",
+    "limit": 10
+  },
+  "runMultiFormula_args": {
+    "begin_date": "auto_minus_60d",
+    "use_minute_data": true
+  },
+  "cooldown_days": 0,
+  "notification": {
+    "wecom": {
+      "enabled": true,
+      "webhook": "",
+      "mentioned_list": [],
+      "mentioned_mobile_list": []
+    },
+    "push_when": "always"
+  },
+  "schedule": {
+    "enabled": true,
+    "cron": "*/30 9-15 * * 1-5",
+    "time": null,
+    "task_name": ""
+  },
+  "report": {
+    "output_dir": "output/reports",
+    "report_mode": "incremental"
+  }
+}

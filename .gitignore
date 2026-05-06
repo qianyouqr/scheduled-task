@@ -1,0 +1,15 @@
+# 用户运行时创建的 job 实例目录（保留 _presets 等以 _ 开头的目录）
+jobs/[^_]*/
+
+# 运行时注册表
+jobs/registry.json
+
+# 根级缓存目录
+.cache/
+.core_root
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
