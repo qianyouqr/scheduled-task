@@ -12,7 +12,8 @@
   set <id> <jsonpath> <value>                       改字段（自动备份；value 是 JSON 字面量或裸字符串）
   disable-asset <id> <ticker>                       把 ticker 加入 disabled_tickers
   enable-asset <id> <ticker>                        从 disabled_tickers 移除
-  run <id> [--dry-run]                              立即跑一次
+  run <id> [--dry-run]                              立即跑一次（不写日志）
+  trigger <id> [--force]                            全量跑一次（等同 _run.bat，写日志）
   validate <id>                                     公式语法校验
   test-push <id>                                    强制推一条测试到企微
   reset-cooldown <id> [--ticker T|--all]            清冷静期
@@ -344,7 +345,6 @@ def cmd_run(args):
             payload["report_error"] = f"{type(e).__name__}: {e}"
 
         if not args.dry_run:
-            _save_last_result(args.id, payload)
             push_when = (job.get("notification") or {}).get("push_when", "always")
             wecom_cfg = ((job.get("notification") or {}).get("wecom") or {})
             should_push = push_when == "always" or bool(sig.get("selected"))
@@ -359,6 +359,7 @@ def cmd_run(args):
                     payload["push_result"] = push_res
                 except Exception as e:
                     payload["push_result"] = {"ok": False, "errcode": -99, "errmsg": f"{type(e).__name__}: {e}"}
+            _save_last_result(args.id, payload)
         job_schema.rebuild_registry()
         _emit(payload)
 
@@ -381,7 +382,7 @@ def cmd_run(args):
 
         sig = scanner.run_signal(job, assets)
         state = cooldown.load_state(state_dir)
-        triggered, cooled = scanner.apply_cooldown(sig["by_ticker"], state, today, int(job.get("cooldown_days") or 7))
+        triggered, cooled = scanner.apply_cooldown(sig["by_ticker"], state, today, int(job.get("cooldown_days", 7)))
 
         all_stocks = list(sig["by_ticker"].values())
 
@@ -425,7 +426,6 @@ def cmd_run(args):
             payload["report_error"] = f"{type(e).__name__}: {e}"
 
         if not args.dry_run:
-            _save_last_result(args.id, payload)
             report_mode = (job.get("report") or {}).get("report_mode", "overwrite")
             push_when = (job.get("notification") or {}).get("push_when", "triggered_only")
             wecom_cfg = ((job.get("notification") or {}).get("wecom") or {})
@@ -441,9 +441,35 @@ def cmd_run(args):
                     payload["push_result"] = push_res
                 except Exception as e:
                     payload["push_result"] = {"ok": False, "errcode": -99, "errmsg": f"{type(e).__name__}: {e}"}
+            _save_last_result(args.id, payload)
 
         job_schema.rebuild_registry()
         _emit(payload)
+
+
+def cmd_trigger(args):
+    """全量跑一次：等同 schtasks 触发 _run.bat — 结果写入 state/logs/YYYYMMDD.log。"""
+    import subprocess
+    extra = ["--force"] if getattr(args, "force", False) else []
+    result = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "run", args.id] + extra,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    output = result.stdout
+    # 追加写日志 —— 与 _run.bat 的 1>>log 等价
+    log_dir = os.path.join(_state_dir(args.id), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    today = date.today().strftime("%Y%m%d")
+    log_path = os.path.join(log_dir, f"{today}.log")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(output)
+        if output and not output.endswith("\n"):
+            f.write("\n")
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        payload = {"ok": False, "error": "inner run output is not valid JSON", "raw": output[:500]}
+    _emit(payload)
 
 
 def cmd_test_push(args):
@@ -518,7 +544,7 @@ def cmd_diagnose(args):
     job = job_schema.load_job(args.id)
     state_dir = _state_dir(args.id)
     today = date.today()
-    cooldown_days = int(job.get("cooldown_days") or 7)
+    cooldown_days = int(job.get("cooldown_days", 7))
 
     state = cooldown.load_state(state_dir)
     cooled = []
@@ -618,6 +644,10 @@ def build_parser():
     sp = sub.add_parser("run"); sp.add_argument("id")
     sp.add_argument("--dry-run", action="store_true"); sp.add_argument("--force", action="store_true")
     sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("trigger"); sp.add_argument("id")
+    sp.add_argument("--force", action="store_true")
+    sp.set_defaults(func=cmd_trigger)
 
     sp = sub.add_parser("test-push"); sp.add_argument("id"); sp.set_defaults(func=cmd_test_push)
 

@@ -142,7 +142,8 @@ metadata:
 用户一句话
    │
    ├─ 看/查询类            → cli list / show / history / diagnose
-   ├─ 立即跑               → cli run <id> [--dry-run]
+   ├─ 立即跑（不写日志）    → cli run <id> [--dry-run]
+   ├─ 全量/完整跑一次      → cli trigger <id>    （写日志、last_result 含 push_result）
    ├─ 推送测试             → cli test-push <id>
    ├─ 改字段               → cli set <id> <jsonpath> <value>   （写入前自动备份）
    ├─ 加 job（有公式）     → cli add <id> --task-type <type> --from preset:<name>
@@ -172,6 +173,7 @@ python {SKILL_ROOT}/scripts/cli.py <command> [...args]
 | "看下 xxx 上次结果" | `cli.py show xxx` |
 | "立即跑一遍（不推送）" | `cli.py run xxx --dry-run` |
 | "正式跑一次" | `cli.py run xxx` |
+| "全量跑一次"/"完整跑一次" | `cli.py trigger xxx` |
 | "推个测试到群里" | `cli.py test-push xxx` |
 | "加一个低PE高股息 Top10 任务" | `cli.py add high-yield-low-pe --task-type stock_picker --from preset:stock_picker_value` |
 | "加一个抄底监控" | `cli.py add my-dip --task-type signal_monitor --from preset:dip_2sigma` |
@@ -184,7 +186,7 @@ python {SKILL_ROOT}/scripts/cli.py <command> [...args]
 | "改成增量报告" | `cli.py set xxx report.report_mode incremental` |
 | "暂停定时" | `cli.py pause xxx` |
 | "恢复定时" | `cli.py resume xxx` |
-| "彻底删掉" | `cli.py delete xxx --yes` |
+| "彻底删掉" | `cli.py delete xxx --yes`（同时删：① schtasks 计划任务 ② jobs/<id>/ 目录 ③ registry.json 记录） |
 | "重置冷静期" | `cli.py reset-cooldown xxx --all` |
 | "今天怎么没提醒？" | `cli.py diagnose xxx` |
 | "撤销上次改动" | `cli.py history xxx` → `cli.py rollback xxx` |
@@ -210,9 +212,13 @@ python {SKILL_ROOT}/scripts/cli.py <command> [...args]
 2. **signal_monitor**：解读 `triggered[]` / `cooled_down[]` / `anomalies[]`；若 `pending_analysis=true` → WebSearch + 框架分析 → 写进报告
 3. **stock_picker**：解读 `selected[]`（rank / 各字段值 / 数据日期）；dry-run 不推企微
 
+> 若用户说"全量跑"/"完整跑"*，改用 `cli.py trigger <id>`：等同 schtasks _run.bat 触发——写入 `state/logs/YYYYMMDD.log`，且 `last_result.json` 中包含 `push_result`。
+
 ### D. 用户要"加 stock_picker job"（已有公式）
 1. `cli.py add <id> --task-type stock_picker --from preset:stock_picker_value`
-2. `cli.py set <id> notification.wecom.webhook <webhook>`
+2. **必须询问用户企微 webhook URL**（`"你的企微机器人 webhook 地址是什么？"`）
+   - 用户提供了 → `cli.py set <id> notification.wecom.webhook <url>` + `cli.py set <id> notification.wecom.enabled true`
+   - 用户明确不配 / 暂时跳过 → `cli.py set <id> notification.wecom.enabled false`，并告知：**「企微推送已关闭，任务会跑但不推送；后续可用 `cli.py set <id> notification.wecom.webhook <url>` + `set ... enabled true` 开启」**
 3. `cli.py set <id> schedule.cron "*/30 9-15 * * 1-5"`
 4. `cli.py set <id> report.report_mode incremental`
 5. `cli.py run <id> --dry-run`（验证 selected[] 符合预期）
@@ -228,6 +234,11 @@ python {SKILL_ROOT}/scripts/cli.py <command> [...args]
 ### F. 用户问"今天怎么没提醒"
 1. `cli.py diagnose <id>` → enabled / last_run / scheduler_status / cooldown_hits（仅 signal_monitor）/ quant_buddy_reachable
 2. 翻译给用户
+
+### G. 用户要"删除 job"
+1. **先向用户确认**：「即将删除 `<id>`，这会同时：① 从 Windows 任务计划删除 `ScheduledTask_<id>` ② 删除 `jobs/<id>/` 整个目录（含历史/日志/报告）③ 从 `registry.json` 移除记录。确认继续吗？」
+2. 用户确认后执行：`cli.py delete <id> --yes`
+3. 验证：输出 `ok: true` 即三步均已完成；如需手动验证可运行 `schtasks /Query /TN ScheduledTask_<id>`（应返回错误，说明已删除）
 
 ---
 

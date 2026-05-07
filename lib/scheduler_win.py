@@ -69,20 +69,61 @@ def _parse_dow(spec: str) -> List[str]:
     return out
 
 
+def _find_claude_exe() -> str:
+    """检测 claude.cmd / claude 可执行文件路径，写死进 _run.bat。
+
+    搜索顺序：
+    1. PATH 中的 claude.cmd（npm global install 默认位置）
+    2. PATH 中的 claude
+    3. %APPDATA%\\npm\\claude.cmd（Windows npm 全局目录）
+    4. %APPDATA%\\npm\\claude
+    找不到则 raise RuntimeError，让 apply-schedule 把错误报给用户。
+    """
+    for name in ("claude.cmd", "claude"):
+        found = shutil.which(name)
+        if found:
+            return found
+    appdata = os.environ.get("APPDATA", "")
+    for name in ("claude.cmd", "claude"):
+        candidate = os.path.join(appdata, "npm", name)
+        if os.path.isfile(candidate):
+            return candidate
+    raise RuntimeError(
+        "找不到 claude 可执行文件。请确认已通过 npm install -g @anthropic-ai/claude-code 安装，"
+        "或在 PATH 中可找到 claude.cmd / claude。\n"
+        "已搜索：PATH, %APPDATA%\\npm\\claude.cmd, %APPDATA%\\npm\\claude"
+    )
+
+
 def _runner_path(job_id: str) -> str:
-    """每个 job 跑一个 .bat —— 调 cli.py run <id>。"""
+    """每个 job 生成一个 _run.bat —— 启动 claude agent，让其完整跑一次该 job。
+
+    agent 收到 prompt 后走 SKILL.md 决策树 → cli trigger <id>（写日志 + 推送），
+    不会重走创建任务流程，也不会递归触发 schtasks。
+    """
     runner_dir = os.path.join(SKILL_ROOT, "jobs", job_id)
     os.makedirs(runner_dir, exist_ok=True)
     runner = os.path.join(runner_dir, "_run.bat")
-    cli = os.path.join(SKILL_ROOT, "scripts", "cli.py").replace("/", "\\")
     log_dir = os.path.join(runner_dir, "state", "logs").replace("/", "\\")
+    claude_exe = _find_claude_exe()
+    # cd 到 %USERPROFILE% 使 claude 能找到 .claude/skills/
+    home = os.path.expanduser("~").replace("/", "\\")
     content = (
         "@echo off\r\n"
-        f'set "JOB_DIR={runner_dir}"\r\n'
-        f'if not exist "{log_dir}" mkdir "{log_dir}"\r\n'
+        "setlocal\r\n"
+        f'set "LOG_DIR={log_dir}"\r\n'
+        f'set "CLAUDE_EXE={claude_exe}"\r\n'
+        f'if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"\r\n'
         f'for /f "tokens=2 delims==" %%I in (\'wmic os get localdatetime /value 2^>nul ^| find "="\') do set DT=%%I\r\n'
         f'set "DAY=%DT:~0,8%"\r\n'
-        f'python "{cli}" run {job_id} 1>>"{log_dir}\\%DAY%.log" 2>>&1\r\n'
+        f'set "LOG=%LOG_DIR%\\%DAY%.log"\r\n'
+        f'echo. >> "%LOG%"\r\n'
+        f'echo ========== %DATE% %TIME% START ========== >> "%LOG%"\r\n'
+        f'cd /d "{home}"\r\n'
+        f'call "%CLAUDE_EXE%" -p "完整跑一次 {job_id}" --permission-mode bypassPermissions --output-format text < NUL >> "%LOG%" 2>&1\r\n'
+        f'set "RC=%ERRORLEVEL%"\r\n'
+        f'echo ========== %DATE% %TIME% END (exit=%RC%) ========== >> "%LOG%"\r\n'
+        f'endlocal & exit /b %RC%\r\n'
     )
     with open(runner, "w", encoding="utf-8", newline="") as f:
         f.write(content)

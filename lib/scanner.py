@@ -178,15 +178,20 @@ def run_signal(job: Dict, assets: List[Dict]) -> Dict:
     trig_map = maps[trigger_name]
     for a in assets:
         code = code_map.get(a["company"], a["ticker"])
+        field_raw = {name: maps[name].get(code, maps[name].get(a["ticker"])) for name in display_fields}
         trig = trig_map.get(code, trig_map.get(a["ticker"]))
         if trig is None:
-            anomalies.append({**a, "error": f"trigger_formula `{trigger_name}` 无数据 (code={code})"})
-            continue
-        try:
-            trig_v = float(trig)
-        except (TypeError, ValueError):
-            anomalies.append({**a, "error": f"trigger 非数值: {trig}"})
-            continue
+            if any(v is not None for v in field_raw.values()):
+                trig_v = 0.0
+            else:
+                anomalies.append({**a, "error": f"trigger_formula `{trigger_name}` 无数据 (code={code})"})
+                continue
+        else:
+            try:
+                trig_v = float(trig)
+            except (TypeError, ValueError):
+                anomalies.append({**a, "error": f"trigger 非数值: {trig}"})
+                continue
         record = {
             "ticker": a["ticker"], "company": a["company"], "code": code,
             "date": last_date,
@@ -194,8 +199,7 @@ def run_signal(job: Dict, assets: List[Dict]) -> Dict:
             "trigger_value": trig_v,
             "fields": {},
         }
-        for name in display_fields:
-            v = maps[name].get(code, maps[name].get(a["ticker"]))
+        for name, v in field_raw.items():
             try:
                 record["fields"][name] = round(float(v), 4) if v is not None else None
             except (TypeError, ValueError):

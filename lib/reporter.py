@@ -195,7 +195,7 @@ def render_push(job: Dict, result: Dict) -> str:
     badge = _category_badge(job)
     parts = [f"**【{name}】{run_time}**", badge]
     if triggered:
-        parts.append(f"🔔 触发 {len(triggered)} 只：")
+        parts.append(f"🔔 本次命中的股票名单（{len(triggered)}只）：")
         for r in triggered[:8]:
             f = r.get("fields") or {}
             f_str = " ".join(f"{k}={v}" for k, v in list(f.items())[:3])
@@ -203,6 +203,6 @@ def render_push(job: Dict, result: Dict) -> str:
         if len(triggered) > 8:
             parts.append(f"…另 {len(triggered)-8} 只见报告")
     else:
-        parts.append("✅ 无触发")
+        parts.append("✅ 本轮无触发信号")
     parts.append(f"\n_scheduled-task / {job['id']}_")
     return "\n".join(parts)
