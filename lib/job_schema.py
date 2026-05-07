@@ -52,9 +52,13 @@ DEFAULT_JOB: Dict[str, Any] = {
         "task_name": "",
     },
     "report": {
-        "template_path": "../../templates/default_report.md",
+        "job_template": "",
         "output_dir": "output/reports",
         "report_mode": "overwrite",
+    },
+    "context": {
+        "run_sop": "",
+        "references": [],
     },
 }
 

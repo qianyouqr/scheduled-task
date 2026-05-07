@@ -112,11 +112,12 @@ python scripts/cli.py set <id> schedule.cron "*/30 9-15 * * 1-5"
 # 4. 配置报告模式
 python scripts/cli.py set <id> report.report_mode incremental
 
-# 5. 验证
-python scripts/cli.py run <id> --dry-run
+# 5. 验证（schema 校验，不跑公式）
+python scripts/cli.py validate <id>
 
 # 6. 注册 Windows 计划任务
 python scripts/cli.py apply-schedule <id>
+# 立即试跑：在对话里让 agent 按 docs/agent-runtime-flow.md 走 13 步
 ```
 
 > 若用户未提供 webhook：`cli.py set <id> notification.wecom.enabled false`，告知后续可用 `set ... webhook <url>` + `set ... enabled true` 开启。
@@ -149,5 +150,6 @@ python scripts/cli.py validate <id>
 
 - stock_picker **无 `asset_source` 字段**，不需要资产池文件
 - 公式中的字段名（如 `A股市盈率（PE, TTM）〔估值数据〕`）须与 quant-buddy confirmDataMulti 实测结果一致，全角括号/中文逗号等**原文保留**
-- 运行时**无 LLM**：公式已物化在 job.json，schtasks 触发时纯执行
+- 运行时是 agent：schtasks → `_run.bat` → `claude -p` → 按 [agent-runtime-flow.md](./agent-runtime-flow.md) 的 13 步流执行。stock_picker 通常不需要归因（无 triggered 概念，直接 TopN 推快照），步骤 8 跳过即可。
+- 公式分批：超过 10 条时 agent 必须切批跑，共用同一 task_id、`force_reusable_array=true`，详见 quant-buddy-skill 的 `tools/run_multi_formula.md`。
 - `push_when` 建议设为 `always`（每次都推快照），不同于 signal_monitor 的 `triggered_only`

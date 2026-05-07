@@ -17,14 +17,24 @@ skill_dir/scheduled-task/
 │       ├── job.json          # 任务配置（由 cli.py 生成和维护）
 │       ├── assets.xlsx       # 资产池文件（推荐，excel 类型时）
 │       ├── assets.csv        # 资产池文件（csv 类型时）
-│       └── history/          # 每次运行的结果快照（JSON）
+│       ├── templates/        # job 级别报告模板（--template-file 复制到此；agent 写报告时优先用）
+│       ├── references/       # 参考资料文件（--reference-files 复制到此；agent 步骤1b读取为背景知识）
+│       ├── state/            # 冷静期状态、上次运行结果
+│       └── .history/         # job.json 备份
 ├── lib/
-│   ├── scanner.py            # 信号扫描核心（资产循环、触发判定、稀疏矩阵修复）
-│   ├── reporter.py           # 推送报文渲染（WeCom Markdown）
-│   ├── scheduler.py          # schtasks 注册/卸载封装
-│   └── ...
+│   ├── asset_source.py       # 资产源加载（excel/csv/inline）
+│   ├── cooldown.py           # 冷静期 triggered.json 管理
+│   ├── job_schema.py         # job.json 读写、备份、registry
+│   ├── quant_buddy.py        # 仅 validate 用：dry-run 跑公式
+│   ├── scheduler_win.py      # schtasks + _run.bat 生成
+│   ├── validator.py          # 公式语法校验
+│   └── wecom.py              # 企微 webhook push
+├── templates/
+│   └── agent_report.md       # Agent 写报告时的标准结构模板
+├── docs/
+│   └── agent-runtime-flow.md # Agent 运行时 13 步流（schtasks 触发后必读）
 ├── scripts/
-│   └── cli.py                # 统一 CLI 入口
+│   └── cli.py                # 统一 CLI（管理命令 + 6 个 agent-path 运行时原语）
 └── presets/
     ├── signal_monitor/       # signal_monitor preset 定义
     └── stock_picker/         # stock_picker preset 定义
@@ -45,6 +55,9 @@ skill_dir/scheduled-task/
 | `notification.wecom.webhook` | string | 条件必填 | — | 企微机器人 webhook URL |
 | `notification.push_when` | string | 否 | `triggered_only` | `triggered_only` / `always` |
 | `report.report_mode` | string | 否 | `incremental` | `incremental` / `full` |
+| `report.job_template` | string | 否 | `""` | job 级别报告模板路径，相对 `jobs/<id>/`（如 `templates/my_report.md`）；非空时 agent 步骤 9 优先于全局 `templates/agent_report.md` |
+| `context.run_sop` | string | 否 | `""` | 给 agent 的额外运行指导文本；非空时整个 13 步流必须遵守其约束 |
+| `context.references` | array | 否 | `[]` | 参考资料文件路径列表，相对 `jobs/<id>/`；agent 步骤 1b 逐一读取作为背景知识 |
 
 ---
 
@@ -62,7 +75,8 @@ skill_dir/scheduled-task/
 | `signal.lookback_days` | int | 否 | 历史回溯天数（默认60） |
 | `signal.category.direction` | string | 否 | `buy` / `sell` / `neutral` |
 | `signal.category.label` | string | 否 | 信号标签（如"抄底"、"突破"） |
-| `analysis_hook.enabled` | bool | 否 | 是否启用触发后 LLM 分析 |
+| `analysis_hook.enabled` | bool | 否 | 是否启用触发后 agent 归因（WebSearch + 框架结论） |
+| `analysis_hook.framework_doc` | string | 否 | 归因框架 markdown 路径，相对 `jobs/<id>/`，默认 `framework.md`；建议放在 `references/framework.md` |
 
 ---
 
@@ -87,13 +101,13 @@ skill_dir/scheduled-task/
 1. **scheduled-task 不生成公式，只透传**
    公式字符串由 quant-buddy-skill 负责确认字段口径和生成；scheduled-task 原样写入 job.json 后执行。
 
-2. **运行时无 LLM**
-   schtasks 触发后只运行 Python 脚本，不调用任何 LLM。所有决策（公式、阈值、排序）均已物化在 job.json。
+2. **运行时是 agent，不是纯 Python**
+   schtasks 触发 `_run.bat` → `claude -p` 启动 agent → agent 按 [agent-runtime-flow.md](./agent-runtime-flow.md) 的 13 步流跑完。公式/字段/触发阈值在 job.json 中声明，但执行/归因/写报告由 agent 完成 — 这才能支持 WebSearch 归因和按框架给结论。
 
-3. **稀疏矩阵处理（scanner.py）**
-   quant 平台对布尔公式返回稀疏矩阵：未触发 = NaN（不是 0）。scanner.py 对此的正确判断：
-   - 如果 trigger_formula 值缺失 **且** 有展示字段数据 → `trigger=False`（正常未触发）
-   - 如果 trigger_formula 值缺失 **且** 无任何展示字段数据 → 归入 anomalies（数据异常）
+3. **稀疏矩阵处理（agent 必须遵守）**
+   quant 平台对布尔公式返回稀疏矩阵：未触发 = NaN（不是 0）。agent 在步骤 6 提取 `last_column_full` 时：
+   - 如果 trigger_formula 末日值缺失 **且** 有展示字段数据 → `trigger=False`（正常未触发）
+   - 如果 trigger_formula 末日值缺失 **且** 无任何展示字段数据 → 归入 anomalies（数据异常）
 
 4. **cooldown_days=0 的特殊语义**
    0 表示"每次都推，不去重"。代码使用 `job.get("cooldown_days", 7)`（不是 `x or 7`），确保 0 被正确处理。

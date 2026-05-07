@@ -5,7 +5,26 @@
 from datetime import date, timedelta
 from typing import Dict, List
 
-from . import quant_buddy, scanner
+from . import quant_buddy
+
+ASSETS_PLACEHOLDER = "{ASSETS}"
+
+
+def _build_pool_args(assets: List[Dict]) -> str:
+    return ", ".join(a["company"] for a in assets if a.get("company"))
+
+
+def _materialize_formulas(formulas: List[Dict], assets: List[Dict]) -> List[str]:
+    """把 job.signal.formulas 实例化成 quant-buddy 接受的字符串列表。"""
+    pool_args = _build_pool_args(assets)
+    out = []
+    for f in formulas:
+        name = (f.get("name") or "").strip()
+        expr = f.get("expression", "")
+        if ASSETS_PLACEHOLDER in expr:
+            expr = expr.replace(ASSETS_PLACEHOLDER, pool_args)
+        out.append(f"{name} = {expr}" if name else expr)
+    return out
 
 
 def validate(job: Dict, assets: List[Dict]) -> Dict:
@@ -49,7 +68,7 @@ def _validate_signal_monitor(job: Dict, assets: List[Dict]) -> Dict:
     api.new_session()
     QuantAPI = quant_buddy.get_api_class()
 
-    formulas = scanner.materialize_formulas(formulas_raw, assets)
+    formulas = _materialize_formulas(formulas_raw, assets)
     today = date.today()
     begin = today - timedelta(days=5)
     try:

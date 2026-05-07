@@ -113,7 +113,7 @@ python scripts/cli.py set <id> notification.wecom.enabled true
 python scripts/cli.py set <id> schedule.cron "*/15 9-15 * * 1-5"
 python scripts/cli.py set <id> report.report_mode incremental
 python scripts/cli.py validate <id>
-python scripts/cli.py run <id> --dry-run
+# 立即试跑：在对话里让 agent 按 docs/agent-runtime-flow.md 走 13 步
 python scripts/cli.py apply-schedule <id>
 ```
 
@@ -171,7 +171,6 @@ python scripts/cli.py set <id> notification.wecom.webhook "https://..."
 python scripts/cli.py set <id> notification.wecom.enabled true
 python scripts/cli.py set <id> schedule.cron "*/30 9-15 * * 1-5"
 python scripts/cli.py validate <id>
-python scripts/cli.py run <id> --dry-run
 python scripts/cli.py apply-schedule <id>
 ```
 
@@ -197,20 +196,18 @@ python scripts/cli.py set <id> signal.display_fields '["字段1","字段2"]'
 
 ## analysis_hook（可选）
 
-开启后，每次有 `triggered` 结果时，scanner 会标记 `pending_analysis=true`，LLM 外层负责对触发股票做 WebSearch + 框架分析，写入报告。
+开启后，agent 在 13 步流的步骤 8 会对每个 triggered ticker 做 WebSearch 归因，并按 `framework_doc` 指定的 markdown 框架组织结论。
 
 ```json
 "analysis_hook": {
   "enabled": true,
-  "framework_doc": "",
-  "websearch_template": {
-    "A": "{company} 近期下跌 原因",
-    "HK": "{company} 下跌",
-    "US": "{ticker} selloff reasons"
-  },
-  "output_sections": ["下跌归因", "框架分类", "抄底结论"]
+  "framework_doc": "framework.md"
 }
 ```
+
+- `framework_doc`：相对 `jobs/<id>/` 的 markdown 路径，默认 `framework.md`。文件内容定义归因小节（如"基本面 / 消息面 / 资金面 / 结论"）。
+- agent 会把该框架的小节标题塞进推送报告的「触发归因」章节，每个 ticker 一次。
+- 不需要 `websearch_template` 或 `output_sections` — agent 会按 framework.md 的结构自适应。
 
 ---
 

@@ -96,18 +96,26 @@ def _find_claude_exe() -> str:
 
 
 def _runner_path(job_id: str) -> str:
-    """每个 job 生成一个 _run.bat —— 启动 claude agent，让其完整跑一次该 job。
+    """每个 job 生成一个 _run.bat —— 启动 claude agent，让其按 SKILL.md 流程跑一次。
 
-    agent 收到 prompt 后走 SKILL.md 决策树 → cli trigger <id>（写日志 + 推送），
-    不会重走创建任务流程，也不会递归触发 schtasks。
+    agent 在单次 `claude -p` 调用内：读 job → load-assets → load-cooldown
+    → 调 quant-buddy-skill 跑公式 → 触发判定 → (有触发时归因/写报告) → push
+    → mark-triggered。schtasks 仅负责启动 agent，不再走 Python scanner。
     """
     runner_dir = os.path.join(SKILL_ROOT, "jobs", job_id)
     os.makedirs(runner_dir, exist_ok=True)
     runner = os.path.join(runner_dir, "_run.bat")
     log_dir = os.path.join(runner_dir, "state", "logs").replace("/", "\\")
     claude_exe = _find_claude_exe()
-    # cd 到 %USERPROFILE% 使 claude 能找到 .claude/skills/
-    home = os.path.expanduser("~").replace("/", "\\")
+    # cd 到 SKILL_ROOT 使相对路径（jobs/、output/、docs/）一致；agent 仍能找到 user-scope skill
+    cwd = SKILL_ROOT.replace("/", "\\")
+    prompt = (
+        f"运行 scheduled-task 任务 {job_id}。"
+        f"严格按 SKILL.md 的『Phase 运行流』执行：读 job → 加载资产 → 加载冷静期 → "
+        f"调 quant-buddy-skill 的 runMultiFormulaBatch 跑公式 → 触发判定 → "
+        f"(有触发时调用归因 hook) → 写 markdown 报告 → push 到企微 → mark-triggered 写冷静期。"
+        f"全部步骤必须在本次调用内完成，不可跳过、不可并行步骤 5-9。"
+    )
     content = (
         "@echo off\r\n"
         "setlocal\r\n"
@@ -119,8 +127,8 @@ def _runner_path(job_id: str) -> str:
         f'set "LOG=%LOG_DIR%\\%DAY%.log"\r\n'
         f'echo. >> "%LOG%"\r\n'
         f'echo ========== %DATE% %TIME% START ========== >> "%LOG%"\r\n'
-        f'cd /d "{home}"\r\n'
-        f'call "%CLAUDE_EXE%" -p "完整跑一次 {job_id}" --permission-mode bypassPermissions --output-format text < NUL >> "%LOG%" 2>&1\r\n'
+        f'cd /d "{cwd}"\r\n'
+        f'call "%CLAUDE_EXE%" -p "{prompt}" --permission-mode bypassPermissions --output-format text < NUL >> "%LOG%" 2>&1\r\n'
         f'set "RC=%ERRORLEVEL%"\r\n'
         f'echo ========== %DATE% %TIME% END (exit=%RC%) ========== >> "%LOG%"\r\n'
         f'endlocal & exit /b %RC%\r\n'

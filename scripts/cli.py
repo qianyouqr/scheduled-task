@@ -12,10 +12,14 @@
   set <id> <jsonpath> <value>                       改字段（自动备份；value 是 JSON 字面量或裸字符串）
   disable-asset <id> <ticker>                       把 ticker 加入 disabled_tickers
   enable-asset <id> <ticker>                        从 disabled_tickers 移除
-  run <id> [--dry-run]                              立即跑一次（不写日志）
-  trigger <id> [--force]                            全量跑一次（等同 _run.bat，写日志）
   validate <id>                                     公式语法校验
-  test-push <id>                                    强制推一条测试到企微
+  test-push <id>                                    推一条测试到企微（不读 last_result）
+  load-assets <id>                                  解析 asset_source，输出 [{ticker,company}] 与 disabled
+  load-cooldown <id>                                输出当前冷静期 ticker 列表（供 agent 过滤）
+  mark-triggered <id> --tickers T1,T2               推送成功后调用，写入 triggered.json
+  push <id> --report-file <md> | --content <text>   读 markdown 推到企微
+  save-result <id> --file <json>                    把 agent 跑完的结果存到 state/last_result.json
+  save-report <id> --file <md>                      按 report_mode 落到 output/reports/
   reset-cooldown <id> [--ticker T|--all]            清冷静期
   pause <id>                                        暂停定时
   resume <id>                                       恢复定时
@@ -42,7 +46,7 @@ except Exception:
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL_ROOT)
 
-from lib import job_schema, asset_source, cooldown, scanner, validator, wecom, scheduler_win, reporter  # noqa: E402
+from lib import job_schema, asset_source, cooldown, validator, wecom, scheduler_win  # noqa: E402
 
 
 # ─────────────────────────────────────────
@@ -93,38 +97,6 @@ def _parse_value(raw: str) -> Any:
         return json.loads(raw)
     except Exception:
         return raw
-
-
-def _is_in_cron_window(cron: str) -> bool:
-    """对于 */N H-range * * DOW-range 类型的 cron，检查当前时刻是否在 H-range 和 DOW-range 内。"""
-    import re as _re
-    parts = cron.strip().split()
-    if len(parts) != 5:
-        return True  # 无法解析，不拦截
-    _, hour, dom, mon, dow = parts
-    now = datetime.now()
-    # 检查 hour 范围
-    if hour != "*":
-        hour_match = _re.fullmatch(r"(\d+)-(\d+)", hour)
-        if hour_match:
-            h_start, h_end = int(hour_match.group(1)), int(hour_match.group(2))
-            if not (h_start <= now.hour <= h_end):
-                return False
-        elif hour.isdigit():
-            if now.hour != int(hour):
-                return False
-    # 检查 dow 范围（1=Mon,...,7=Sun，Python weekday(): Mon=0,...,Sun=6）
-    if dow != "*":
-        dow_match = _re.fullmatch(r"(\d+)-(\d+)", dow)
-        py_dow = now.weekday() + 1  # Mon=1, Sun=7
-        if dow_match:
-            d_start, d_end = int(dow_match.group(1)), int(dow_match.group(2))
-            if not (d_start <= py_dow <= d_end):
-                return False
-        elif dow.isdigit():
-            if py_dow != int(dow):
-                return False
-    return True
 
 
 # ─────────────────────────────────────────
@@ -207,23 +179,74 @@ def cmd_add(args):
         data.setdefault("schedule", {})["task_name"] = f"ScheduledTask_{args.id}"
 
     job_schema.save_job(args.id, data, backup=False)
+    job_dir = job_schema.job_dir(args.id)
+
+    # ── 复制 job 级别模板 ──────────────────────────────────────
+    copied_template = None
+    if args.template_file:
+        src = args.template_file
+        if not os.path.isabs(src):
+            src = os.path.normpath(os.path.join(os.getcwd(), src))
+        if not os.path.exists(src):
+            _err(f"--template-file 不存在: {src}")
+        tpl_dir = os.path.join(job_dir, "templates")
+        os.makedirs(tpl_dir, exist_ok=True)
+        dest = os.path.join(tpl_dir, os.path.basename(src))
+        shutil.copy2(src, dest)
+        rel = os.path.relpath(dest, job_dir).replace("\\", "/")
+        data.setdefault("report", {})["job_template"] = rel
+        copied_template = rel
+        job_schema.save_job(args.id, data, backup=False)  # 用模板路径更新 job.json
+
+    # ── 复制参考资料 ───────────────────────────────────────────
+    copied_refs = []
+    if args.reference_files:
+        ref_dir = os.path.join(job_dir, "references")
+        os.makedirs(ref_dir, exist_ok=True)
+        ref_paths = []
+        for raw in args.reference_files.split(","):
+            src = raw.strip()
+            if not src:
+                continue
+            if not os.path.isabs(src):
+                src = os.path.normpath(os.path.join(os.getcwd(), src))
+            if not os.path.exists(src):
+                _err(f"--reference-files 中有文件不存在: {src}")
+            dest = os.path.join(ref_dir, os.path.basename(src))
+            shutil.copy2(src, dest)
+            rel = os.path.relpath(dest, job_dir).replace("\\", "/")
+            ref_paths.append(rel)
+            copied_refs.append(rel)
+        if ref_paths:
+            data.setdefault("context", {})["references"] = ref_paths
+            job_schema.save_job(args.id, data, backup=False)
+
+    # ── 写入 run_sop ──────────────────────────────────────────
+    if args.run_sop:
+        data.setdefault("context", {})["run_sop"] = args.run_sop
+        job_schema.save_job(args.id, data, backup=False)
+
     job_schema.rebuild_registry()
     task_type = data.get("task_type", "signal_monitor")
     if task_type == "stock_picker":
         next_steps = [
             f"cli.py set {args.id} notification.wecom.webhook <webhook_url>",
             f"cli.py set {args.id} schedule.cron \"*/30 9-15 * * 1-5\"",
-            f"cli.py run {args.id} --dry-run",
             f"cli.py apply-schedule {args.id}",
         ]
     else:
         next_steps = [
-            f"cli.py set {args.id} asset_source.assets <list>  或编辑 jobs/{args.id}/job.json",
+            f"cli.py set {args.id} asset_source.type excel",
+            f"cli.py set {args.id} asset_source.path assets.xlsx",
             f"cli.py validate {args.id}",
-            f"cli.py run {args.id} --dry-run",
             f"cli.py apply-schedule {args.id}",
         ]
-    _emit({"ok": True, "id": args.id, "task_type": task_type, "next": next_steps})
+    _emit({
+        "ok": True, "id": args.id, "task_type": task_type,
+        "copied_template": copied_template,
+        "copied_references": copied_refs,
+        "next": next_steps,
+    })
 
 
 def cmd_delete(args):
@@ -299,187 +322,163 @@ def cmd_validate(args):
     _emit({"ok": result["ok"], "id": args.id, **result})
 
 
-def cmd_run(args):
+def cmd_load_assets(args):
+    """解析 asset_source（excel/csv/inline），输出资产列表与 disabled 名单。
+
+    供 agent 在运行时第一步调用。"""
     job = job_schema.load_job(args.id)
-    if not job.get("enabled", True) and not args.force:
-        _err(f"job {args.id} 已 disabled；用 --force 强制跑")
-
-    task_type = job.get("task_type", "signal_monitor")
     base_dir = job_schema.job_dir(args.id)
-    state_dir = _state_dir(args.id)
-    os.makedirs(state_dir, exist_ok=True)
-
-    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # cron 时间窗口守卫（用于 */N H-range * * DOW-range 场景）
-    cron = (job.get("schedule") or {}).get("cron")
-    if cron and not args.dry_run and not args.force:
-        if not _is_in_cron_window(cron):
-            _emit({"ok": True, "id": args.id, "skipped": True, "reason": f"当前时刻不在 cron 窗口: {cron}"})
+    src = job.get("asset_source") or {}
+    task_type = job.get("task_type", "signal_monitor")
 
     if task_type == "stock_picker":
-        # ── stock_picker 分支 ──────────────────────────────────
-        sig = scanner.run_stock_picker(job)
-        payload = {
-            "ok": sig.get("fatal") is None,
-            "id": args.id,
-            "run_time": run_time,
-            "dry_run": bool(args.dry_run),
-            "task_type": task_type,
-            "formulas": job.get("formulas") or [],
-            "selected": sig.get("selected") or [],
-            "total_passed": sig.get("total_passed", 0),
-            "anomalies": sig.get("anomalies") or [],
-            "last_date": sig.get("last_date", ""),
-            "fatal": sig.get("fatal"),
-            "summary": {
-                "total_passed": sig.get("total_passed", 0),
-                "selected_count": len(sig.get("selected") or []),
-                "fatal": sig.get("fatal"),
-            },
-        }
-        try:
-            report_path = reporter.write_report(job, payload, base_dir)
-            payload["report_path"] = os.path.relpath(report_path, SKILL_ROOT).replace("\\", "/")
-        except Exception as e:
-            payload["report_error"] = f"{type(e).__name__}: {e}"
+        # stock_picker 可能没有 asset_source（全市场扫）
+        _emit({"ok": True, "id": args.id, "task_type": task_type,
+               "assets": [], "disabled_tickers": list(src.get("disabled_tickers") or [])})
 
-        if not args.dry_run:
-            push_when = (job.get("notification") or {}).get("push_when", "always")
-            wecom_cfg = ((job.get("notification") or {}).get("wecom") or {})
-            should_push = push_when == "always" or bool(sig.get("selected"))
-            if wecom_cfg.get("enabled") and should_push:
-                try:
-                    push_text = reporter.render_push(job, payload)
-                    push_res = wecom.push_markdown(
-                        wecom_cfg.get("webhook", ""), push_text,
-                        mentioned_list=wecom_cfg.get("mentioned_list") or None,
-                        mentioned_mobile_list=wecom_cfg.get("mentioned_mobile_list") or None,
-                    )
-                    payload["push_result"] = push_res
-                except Exception as e:
-                    payload["push_result"] = {"ok": False, "errcode": -99, "errmsg": f"{type(e).__name__}: {e}"}
-            _save_last_result(args.id, payload)
-        job_schema.rebuild_registry()
-        _emit(payload)
-
-    else:
-        # ── signal_monitor 分支（原有逻辑）──────────────────────
-        today = date.today()
-
-        try:
-            current_assets = asset_source.load_assets(job["asset_source"], base_dir)
-        except Exception as e:
-            _err(f"加载资产失败: {e}")
-
-        status, assets, pool_diff = asset_source.reconcile(
-            job["asset_source"]["type"], current_assets, state_dir,
-        )
-        if status == "auto_synced":
-            s = pool_diff
-            print(f"ℹ️ 资产池已同步：+{len(s.get('added') or [])} -{len(s.get('removed') or [])} ~{len(s.get('modified') or [])}",
-                  file=sys.stderr, flush=True)
-
-        sig = scanner.run_signal(job, assets)
-        state = cooldown.load_state(state_dir)
-        triggered, cooled = scanner.apply_cooldown(sig["by_ticker"], state, today, int(job.get("cooldown_days", 7)))
-
-        all_stocks = list(sig["by_ticker"].values())
-
-        if not args.dry_run:
-            for r in triggered:
-                state[r["ticker"]] = run_time
-            cooldown.save_state(state_dir, state)
-
-        summary = {
-            "total_assets": len(assets),
-            "triggered_count": len(triggered),
-            "cooled_down_count": len(cooled),
-            "anomalies_count": len(sig.get("anomalies") or []),
-            "fatal": sig.get("fatal"),
-        }
-
-        pending_analysis = bool((job.get("analysis_hook") or {}).get("enabled")) and bool(triggered)
-
-        payload = {
-            "ok": sig.get("fatal") is None,
-            "id": args.id,
-            "run_time": run_time,
-            "formulas": sig.get("formulas") or [],
-            "dry_run": bool(args.dry_run),
-            "task_type": task_type,
-            "snapshot_status": status,
-            "asset_pool_change": pool_diff,
-            "triggered": triggered,
-            "cooled_down": cooled,
-            "all_stocks": all_stocks,
-            "anomalies": sig.get("anomalies") or [],
-            "summary": summary,
-            "pending_analysis": pending_analysis,
-            "analysis_hook": job.get("analysis_hook") if pending_analysis else None,
-        }
-
-        try:
-            report_path = reporter.write_report(job, payload, base_dir)
-            payload["report_path"] = os.path.relpath(report_path, SKILL_ROOT).replace("\\", "/")
-        except Exception as e:
-            payload["report_error"] = f"{type(e).__name__}: {e}"
-
-        if not args.dry_run:
-            report_mode = (job.get("report") or {}).get("report_mode", "overwrite")
-            push_when = (job.get("notification") or {}).get("push_when", "triggered_only")
-            wecom_cfg = ((job.get("notification") or {}).get("wecom") or {})
-            should_push = push_when == "always" or triggered or (report_mode == "incremental" and cooled)
-            if wecom_cfg.get("enabled") and should_push:
-                try:
-                    push_text = reporter.render_push(job, payload)
-                    push_res = wecom.push_markdown(
-                        wecom_cfg.get("webhook", ""), push_text,
-                        mentioned_list=wecom_cfg.get("mentioned_list") or None,
-                        mentioned_mobile_list=wecom_cfg.get("mentioned_mobile_list") or None,
-                    )
-                    payload["push_result"] = push_res
-                except Exception as e:
-                    payload["push_result"] = {"ok": False, "errcode": -99, "errmsg": f"{type(e).__name__}: {e}"}
-            _save_last_result(args.id, payload)
-
-        job_schema.rebuild_registry()
-        _emit(payload)
-
-
-def cmd_trigger(args):
-    """全量跑一次：等同 schtasks 触发 _run.bat — 结果写入 state/logs/YYYYMMDD.log。"""
-    import subprocess
-    extra = ["--force"] if getattr(args, "force", False) else []
-    result = subprocess.run(
-        [sys.executable, os.path.abspath(__file__), "run", args.id] + extra,
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    output = result.stdout
-    # 追加写日志 —— 与 _run.bat 的 1>>log 等价
-    log_dir = os.path.join(_state_dir(args.id), "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    today = date.today().strftime("%Y%m%d")
-    log_path = os.path.join(log_dir, f"{today}.log")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(output)
-        if output and not output.endswith("\n"):
-            f.write("\n")
     try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
-        payload = {"ok": False, "error": "inner run output is not valid JSON", "raw": output[:500]}
-    _emit(payload)
+        assets = asset_source.load_assets(src, base_dir)
+    except Exception as e:
+        _err(f"加载资产失败: {type(e).__name__}: {e}")
+    _emit({
+        "ok": True,
+        "id": args.id,
+        "task_type": task_type,
+        "asset_source_type": src.get("type"),
+        "assets": assets,
+        "disabled_tickers": sorted(set(src.get("disabled_tickers") or [])),
+        "count": len(assets),
+    })
+
+
+def cmd_load_cooldown(args):
+    """输出当前冷静期内的 ticker（agent 在判触发前需要先过滤掉这些）。"""
+    job = job_schema.load_job(args.id)
+    state_dir = _state_dir(args.id)
+    today = date.today()
+    cooldown_days = int(job.get("cooldown_days", 7))
+    state = cooldown.load_state(state_dir)
+    cooled = []
+    for ticker, last in state.items():
+        if cooldown.is_cooled_down(last, today, cooldown_days):
+            cooled.append({
+                "ticker": ticker,
+                "last_triggered": last,
+                "cooldown_end": cooldown.cooldown_end(last, cooldown_days),
+            })
+    _emit({
+        "ok": True,
+        "id": args.id,
+        "today": today.strftime("%Y-%m-%d"),
+        "cooldown_days": cooldown_days,
+        "cooled_tickers": [c["ticker"] for c in cooled],
+        "cooled_detail": cooled,
+        "raw_state": state,
+    })
+
+
+def cmd_mark_triggered(args):
+    """推送成功后由 agent 调用：把 ticker 写进 triggered.json，启动冷静期。"""
+    state_dir = _state_dir(args.id)
+    os.makedirs(state_dir, exist_ok=True)
+    tickers = [t.strip() for t in (args.tickers or "").split(",") if t.strip()]
+    if not tickers:
+        _err("--tickers 不能为空（用逗号分隔）")
+    state = cooldown.load_state(state_dir)
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for t in tickers:
+        state[t] = now_iso
+    cooldown.save_state(state_dir, state)
+    _emit({"ok": True, "id": args.id, "marked": tickers, "at": now_iso})
+
+
+def cmd_push(args):
+    """读 markdown 文件（或 --content 字符串）推到企微。"""
+    job = job_schema.load_job(args.id)
+    wecom_cfg = ((job.get("notification") or {}).get("wecom") or {})
+    if not wecom_cfg.get("enabled"):
+        _err("notification.wecom.enabled = false，拒绝推送")
+    webhook = wecom_cfg.get("webhook") or ""
+    if not webhook:
+        _err("notification.wecom.webhook 为空")
+
+    if args.report_file:
+        path = args.report_file
+        if not os.path.isabs(path):
+            path = os.path.normpath(os.path.join(SKILL_ROOT, path))
+        if not os.path.exists(path):
+            _err(f"报告文件不存在: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    elif args.content:
+        text = args.content
+    else:
+        _err("需要 --report-file <md> 或 --content <text>")
+
+    res = wecom.push_markdown(
+        webhook, text,
+        mentioned_list=wecom_cfg.get("mentioned_list") or None,
+        mentioned_mobile_list=wecom_cfg.get("mentioned_mobile_list") or None,
+    )
+    _emit({"ok": res["ok"], "id": args.id, "push": res, "bytes": len(text.encode("utf-8"))})
+
+
+def cmd_save_result(args):
+    """把 agent 跑完的 JSON 结果存到 state/last_result.json，供 show / diagnose 读。"""
+    if not os.path.exists(args.file):
+        _err(f"结果文件不存在: {args.file}")
+    try:
+        payload = json.load(open(args.file, "r", encoding="utf-8"))
+    except Exception as e:
+        _err(f"解析 JSON 失败: {type(e).__name__}: {e}")
+    if not isinstance(payload, dict):
+        _err("结果 JSON 顶层必须是对象")
+    payload.setdefault("id", args.id)
+    payload.setdefault("run_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    _save_last_result(args.id, payload)
+    job_schema.rebuild_registry()
+    _emit({"ok": True, "id": args.id, "saved_to": _last_result_path(args.id)})
+
+
+def cmd_save_report(args):
+    """按 job.report.report_mode 把 agent 写的 markdown 存到 jobs/<id>/<output_dir>/。"""
+    if not os.path.exists(args.file):
+        _err(f"报告文件不存在: {args.file}")
+    job = job_schema.load_job(args.id)
+    mode = (job.get("report") or {}).get("report_mode", "overwrite")
+    out_dir_rel = (job.get("report") or {}).get("output_dir", "output/reports")
+    job_dir = os.path.join(SKILL_ROOT, "jobs", args.id)
+    out_dir = os.path.normpath(os.path.join(job_dir, out_dir_rel))
+    os.makedirs(out_dir, exist_ok=True)
+    with open(args.file, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    if mode == "incremental":
+        ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        dest = os.path.join(out_dir, f"{ts}.md")
+    else:
+        dest = os.path.join(out_dir, "latest.md")
+
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write(text)
+    _emit({
+        "ok": True,
+        "id": args.id,
+        "mode": mode,
+        "saved_to": os.path.relpath(dest, SKILL_ROOT).replace("\\", "/"),
+        "bytes": len(text.encode("utf-8")),
+    })
 
 
 def cmd_test_push(args):
+    """推一条静态测试消息到企微（不依赖 last_result，不依赖任何渲染逻辑）。"""
     job = job_schema.load_job(args.id)
-    last = _load_last_result(args.id)
-    if last:
-        text = "[TEST]\n" + reporter.render_push(job, last)
-    else:
-        text = f"[TEST] **{job.get('name') or job['id']}**\n_scheduled-task 测试推送 @ {datetime.now().isoformat(timespec='seconds')}_"
     wecom_cfg = ((job.get("notification") or {}).get("wecom") or {})
+    text = (
+        f"[TEST] **{job.get('name') or job['id']}**\n"
+        f"_scheduled-task 测试推送 @ {datetime.now().isoformat(timespec='seconds')}_\n"
+        f"id: `{job['id']}` | task_type: `{job.get('task_type', 'signal_monitor')}`"
+    )
     res = wecom.push_markdown(
         wecom_cfg.get("webhook", ""), text,
         mentioned_list=wecom_cfg.get("mentioned_list") or None,
@@ -626,6 +625,9 @@ def build_parser():
     sp.add_argument("--task-type", dest="task_type", default=None, help="signal_monitor 或 stock_picker")
     sp.add_argument("--scaffold", action="store_true", help="建空骨架（无公式）")
     sp.add_argument("--formulas-file", dest="formulas_file", default=None, help="从 JSON 文件读取公式")
+    sp.add_argument("--template-file", dest="template_file", default=None, help="job 级别报告模板 .md，复制到 jobs/<id>/templates/")
+    sp.add_argument("--reference-files", dest="reference_files", default=None, help="逗号分隔的参考资料文件列表，复制到 jobs/<id>/references/")
+    sp.add_argument("--run-sop", dest="run_sop", default=None, help="给 agent 的额外运行 SOP 文本，写入 job.context.run_sop")
     sp.set_defaults(func=cmd_add)
 
     sp = sub.add_parser("delete"); sp.add_argument("id"); sp.add_argument("--yes", action="store_true")
@@ -641,13 +643,27 @@ def build_parser():
 
     sp = sub.add_parser("validate"); sp.add_argument("id"); sp.set_defaults(func=cmd_validate)
 
-    sp = sub.add_parser("run"); sp.add_argument("id")
-    sp.add_argument("--dry-run", action="store_true"); sp.add_argument("--force", action="store_true")
-    sp.set_defaults(func=cmd_run)
+    # ── agent-path 运行时原语 ─────────────────────────────────
+    sp = sub.add_parser("load-assets"); sp.add_argument("id"); sp.set_defaults(func=cmd_load_assets)
 
-    sp = sub.add_parser("trigger"); sp.add_argument("id")
-    sp.add_argument("--force", action="store_true")
-    sp.set_defaults(func=cmd_trigger)
+    sp = sub.add_parser("load-cooldown"); sp.add_argument("id"); sp.set_defaults(func=cmd_load_cooldown)
+
+    sp = sub.add_parser("mark-triggered"); sp.add_argument("id")
+    sp.add_argument("--tickers", required=True, help="逗号分隔的 ticker 列表")
+    sp.set_defaults(func=cmd_mark_triggered)
+
+    sp = sub.add_parser("push"); sp.add_argument("id")
+    sp.add_argument("--report-file", dest="report_file", default=None, help="markdown 文件路径")
+    sp.add_argument("--content", default=None, help="直接传文本（与 --report-file 二选一）")
+    sp.set_defaults(func=cmd_push)
+
+    sp = sub.add_parser("save-result"); sp.add_argument("id")
+    sp.add_argument("--file", required=True, help="结果 JSON 文件路径")
+    sp.set_defaults(func=cmd_save_result)
+
+    sp = sub.add_parser("save-report"); sp.add_argument("id")
+    sp.add_argument("--file", required=True, help="markdown 报告文件路径")
+    sp.set_defaults(func=cmd_save_report)
 
     sp = sub.add_parser("test-push"); sp.add_argument("id"); sp.set_defaults(func=cmd_test_push)
 

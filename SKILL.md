@@ -28,9 +28,10 @@ metadata:
 
 | 文档 | 内容 |
 |------|------|
+| [docs/agent-runtime-flow.md](docs/agent-runtime-flow.md) | **Agent 运行时 13 步流**（schtasks 触发后必读）+ Agent 严格约束 |
 | [docs/signal-monitor-sop.md](docs/signal-monitor-sop.md) | signal_monitor SOP：触发判定、冷静期、**资产池文件管理规则**、信号 presets、完整工作流、analysis_hook |
 | [docs/stock-picker-sop.md](docs/stock-picker-sop.md) | stock_picker SOP：result_handler 字段、begin_date 占位符、工作流 D/E |
-| [docs/cli-reference.md](docs/cli-reference.md) | CLI 速查表、工作流 A-G（含暂停/恢复/删除）、常见问题排查 |
+| [docs/cli-reference.md](docs/cli-reference.md) | CLI 速查表（含 6 个 agent-path 原语）、工作流 A-G、常见问题排查 |
 | [docs/job-schema.md](docs/job-schema.md) | 目录结构、公共字段、signal_monitor/stock_picker 专属字段、关键约束 & 心智模型、cron 示例 |
 
 ---
@@ -50,7 +51,7 @@ metadata:
   生成公式（走 quant-standard.md 流程），最后 `cli.py set ... formulas <list>` 写回。
   CLI 不内置 LLM，公式生成发生在对话层。
 
-运行时（schtasks 触发）永远是路径 A：纯执行、确定性、无 LLM。
+**运行时架构（v2 — agent path）**：schtasks 触发 `_run.bat` → 启动 `claude -p` → agent 按 [docs/agent-runtime-flow.md](docs/agent-runtime-flow.md) 的 13 步流跑完 job：读 job → load-assets → load-cooldown → 调 quant-buddy-skill 的 `runMultiFormulaBatch` 跑公式 → 末日值/TopN → 触发判定 →（有触发时 WebSearch 归因）→ 写 markdown 报告 → push 到企微 → push 成功后才 mark-triggered。CLI 只提供原语命令（`load-assets` / `load-cooldown` / `mark-triggered` / `push` / `save-result` / `save-report`），不再提供 `run` / `trigger` 这种「一键全跑」的 Python 包装 —— 老路径会绕过 quant-buddy-skill 的 SOP 和 agent 的归因能力。
 
 ---
 
@@ -91,7 +92,7 @@ metadata:
 对**全市场/指定板块**跑一组筛选排序公式 → 取 TopN 快照 → 每次都推。
 公式由 quant-buddy 生成，scheduled-task **原样透传**。
 
-> ⚠️ **公式分批约束（scanner.py 自动执行，无需 Agent 干预）**：quant-buddy 服务端单次公式数硬上限为 **10 条**。`scanner.py` 在 `run_stock_picker()` 中已内置分批循环（每批 ≤10 条，同一 `task_id` 跨批次复用变量）。Agent 和用户**不需要**手动分批，`formulas` 数组可以完整写入 job.json，执行时自动切分。
+> ⚠️ **公式分批约束（agent 必须遵守）**：quant-buddy 服务端单次公式数硬上限为 **10 条**。`formulas` 数组可以完整写入 job.json —— 但运行时 agent 必须按 quant-buddy-skill 的 `tools/run_multi_formula.md` 切批：每批 ≤10 条、共用同一 `task_id`、`force_reusable_array=true`，使后批可以引用前批生成的中间变量。
 
 ```json
 {
@@ -155,19 +156,27 @@ metadata:
 用户一句话
    │
    ├─ 看/查询类            → cli list / show / history / diagnose
-   ├─ 立即跑（不写日志）    → cli run <id> [--dry-run]
-   ├─ 全量/完整跑一次      → cli trigger <id>    （写日志、last_result 含 push_result）
+   ├─ 立即跑一次（对话里） → 直接按 docs/agent-runtime-flow.md 的 13 步流走
+   │                          （不要再找 cli run / trigger，它们已被删除）
    ├─ 推送测试             → cli test-push <id>
    ├─ 改字段               → cli set <id> <jsonpath> <value>   （写入前自动备份）
    ├─ 加 job（有公式）     → cli add <id> --task-type <type> --from preset:<name>
    │                          或 --formulas-file <formulas.json>
+   │                          [--template-file 报告模板.md]（复制到 jobs/<id>/templates/）
+   │                          [--reference-files 框架.md,背景.md]（复制到 jobs/<id>/references/）
+   │                          [--run-sop "额外执行约束"]（写入 job.context.run_sop）
    ├─ 加 job（没有公式）   → cli add <id> --task-type <type> --scaffold
+   │                          [--template-file ...] [--reference-files ...] [--run-sop ...]
    │                          → 对话里调 quant-buddy-skill 生成公式
    │                          → cli set <id> formulas '[...]'
    ├─ 删 job               → cli delete <id> --yes
    ├─ 暂停/恢复            → cli pause <id> / resume <id>
    ├─ 改公式后             → cli validate <id>
    └─ 改时间               → cli set schedule.cron/time ... → cli apply-schedule <id>
+
+定时触发时（_run.bat → claude -p）：
+   按 docs/agent-runtime-flow.md 的 13 步流执行（load-assets → 跑公式 → 触发判定
+   → 归因 → 写报告 → push → mark-triggered → save-report → save-result）
 ```
 
 所有命令统一入口：
