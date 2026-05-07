@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import asset_source, cooldown, quant_buddy
 
 ASSETS_PLACEHOLDER = "{ASSETS}"
+_CHUNK_SIZE = 10  # quant-buddy 服务端单次公式数硬上限，scanner 与其对齐
 
 
 def _build_pool_args(assets: List[Dict]) -> str:
@@ -265,24 +266,30 @@ def run_stock_picker(job: Dict) -> Dict:
     api.new_session()
     QuantAPI = quant_buddy.get_api_class()
 
-    try:
-        resp = api.run_multi_formula(
-            formulas=formulas,
-            begin_date=begin_date,
-            include_description=False,
-            use_minute_data=use_minute,
-        )
-    except Exception as e:
-        return {"selected": [], "total_passed": 0, "fatal": f"runMultiFormula 异常: {type(e).__name__}: {str(e)[:200]}",
-                "anomalies": [], "last_date": ""}
+    # ── 分批执行（服务端硬上限 _CHUNK_SIZE 条/批，同一 task_id 跨批次复用变量）──
+    ids_map: Dict[str, str] = {}
+    for chunk_idx, chunk_start in enumerate(range(0, len(formulas), _CHUNK_SIZE)):
+        chunk = formulas[chunk_start: chunk_start + _CHUNK_SIZE]
+        try:
+            resp = api.run_multi_formula(
+                formulas=chunk,
+                begin_date=begin_date,
+                include_description=False,
+                use_minute_data=use_minute,
+            )
+        except Exception as e:
+            return {"selected": [], "total_passed": 0,
+                    "fatal": f"runMultiFormula 异常(batch {chunk_idx + 1}): {type(e).__name__}: {str(e)[:200]}",
+                    "anomalies": [], "last_date": ""}
 
-    if isinstance(resp, dict) and resp.get("code", 0) != 0:
-        err_obj = resp.get("error") or {}
-        msg = (resp.get("message") or err_obj.get("message") or str(resp))[:300]
-        return {"selected": [], "total_passed": 0, "fatal": f"runMultiFormula code={resp.get('code')}: {msg}",
-                "anomalies": [], "last_date": ""}
+        if isinstance(resp, dict) and resp.get("code", 0) != 0:
+            err_obj = resp.get("error") or {}
+            msg = (resp.get("message") or err_obj.get("message") or str(resp))[:300]
+            return {"selected": [], "total_passed": 0,
+                    "fatal": f"runMultiFormula code={resp.get('code')} (batch {chunk_idx + 1}): {msg}",
+                    "anomalies": [], "last_date": ""}
 
-    ids_map = QuantAPI.extract_obj_ids(resp)
+        ids_map.update(QuantAPI.extract_obj_ids(resp))
     # 所有需要读取的公式名
     needed_names = [result_formula] + [vc["from"] for vc in value_columns if vc.get("from") and vc["from"] != result_formula]
     needed_names = list(dict.fromkeys(needed_names))

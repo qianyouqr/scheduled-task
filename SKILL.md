@@ -24,6 +24,17 @@ metadata:
 
 ---
 
+## 详细文档（docs/）
+
+| 文档 | 内容 |
+|------|------|
+| [docs/signal-monitor-sop.md](docs/signal-monitor-sop.md) | signal_monitor SOP：触发判定、冷静期、**资产池文件管理规则**、信号 presets、完整工作流、analysis_hook |
+| [docs/stock-picker-sop.md](docs/stock-picker-sop.md) | stock_picker SOP：result_handler 字段、begin_date 占位符、工作流 D/E |
+| [docs/cli-reference.md](docs/cli-reference.md) | CLI 速查表、工作流 A-G（含暂停/恢复/删除）、常见问题排查 |
+| [docs/job-schema.md](docs/job-schema.md) | 目录结构、公共字段、signal_monitor/stock_picker 专属字段、关键约束 & 心智模型、cron 示例 |
+
+---
+
 ## 职责边界（最重要）
 
 | 维度 | scheduled-task 干什么 | quant-buddy-skill 干什么 |
@@ -79,6 +90,8 @@ metadata:
 
 对**全市场/指定板块**跑一组筛选排序公式 → 取 TopN 快照 → 每次都推。
 公式由 quant-buddy 生成，scheduled-task **原样透传**。
+
+> ⚠️ **公式分批约束（scanner.py 自动执行，无需 Agent 干预）**：quant-buddy 服务端单次公式数硬上限为 **10 条**。`scanner.py` 在 `run_stock_picker()` 中已内置分批循环（每批 ≤10 条，同一 `task_id` 跨批次复用变量）。Agent 和用户**不需要**手动分批，`formulas` 数组可以完整写入 job.json，执行时自动切分。
 
 ```json
 {
@@ -163,208 +176,4 @@ python {SKILL_ROOT}/scripts/cli.py <command> [...args]
 ```
 **所有 stdout 都是 JSON**；人类可读消息走 stderr。
 
----
-
-## CLI 速查
-
-| 用户说 | 命令 |
-|---|---|
-| "现在有哪些任务" | `cli.py list` |
-| "看下 xxx 上次结果" | `cli.py show xxx` |
-| "立即跑一遍（不推送）" | `cli.py run xxx --dry-run` |
-| "正式跑一次" | `cli.py run xxx` |
-| "全量跑一次"/"完整跑一次" | `cli.py trigger xxx` |
-| "推个测试到群里" | `cli.py test-push xxx` |
-| "加一个低PE高股息 Top10 任务" | `cli.py add high-yield-low-pe --task-type stock_picker --from preset:stock_picker_value` |
-| "加一个抄底监控" | `cli.py add my-dip --task-type signal_monitor --from preset:dip_2sigma` |
-| "先建空任务（没有公式）" | `cli.py add my-task --task-type stock_picker --scaffold` |
-| "把公式写进去" | `cli.py set my-task formulas '["公式1","公式2"]'` |
-| "把 result_handler 写进去" | `cli.py set my-task result_handler '{"mode":"topn_by_mask",...}'` |
-| "改成早 8:30 跑" | `cli.py set xxx schedule.time 08:30` → `cli.py apply-schedule xxx` |
-| "改成每 30 分钟盘中跑" | `cli.py set xxx schedule.cron "*/30 9-15 * * 1-5"` → `cli.py apply-schedule xxx` |
-| "改成无论是否触发都推" | `cli.py set xxx notification.push_when always` |
-| "改成增量报告" | `cli.py set xxx report.report_mode incremental` |
-| "暂停定时" | `cli.py pause xxx` |
-| "恢复定时" | `cli.py resume xxx` |
-| "彻底删掉" | `cli.py delete xxx --yes`（同时删：① schtasks 计划任务 ② jobs/<id>/ 目录 ③ registry.json 记录） |
-| "重置冷静期" | `cli.py reset-cooldown xxx --all` |
-| "今天怎么没提醒？" | `cli.py diagnose xxx` |
-| "撤销上次改动" | `cli.py history xxx` → `cli.py rollback xxx` |
-| "校验一下配置" | `cli.py validate xxx` |
-
----
-
-## 工作流（LLM 标准动作）
-
-### A. 用户问"现在有哪些任务"
-1. `cli.py list` → 列出 task_type / schedule / last_run / 上次结果摘要
-2. 让用户选具体 job 后走 B/C/D/E
-
-### B. 用户要"改字段"
-1. 必要时先 `cli.py show <id>` 拿当前值
-2. `cli.py set <id> <jsonpath> <value>`（自动备份 `.history/`，保留最近 20 份）
-3. 若改的是 `formulas` / `signal.formulas` → `cli.py validate <id>`
-4. 若改的是 `schedule.*` → `cli.py apply-schedule <id>`
-5. 一句话回报：改了什么 / 备份在哪 / 是否 rollback
-
-### C. 用户要"立即跑一遍"
-1. `cli.py run <id> --dry-run` 拿结构化 JSON
-2. **signal_monitor**：解读 `triggered[]` / `cooled_down[]` / `anomalies[]`；若 `pending_analysis=true` → WebSearch + 框架分析 → 写进报告
-3. **stock_picker**：解读 `selected[]`（rank / 各字段值 / 数据日期）；dry-run 不推企微
-
-> 若用户说"全量跑"/"完整跑"*，改用 `cli.py trigger <id>`：等同 schtasks _run.bat 触发——写入 `state/logs/YYYYMMDD.log`，且 `last_result.json` 中包含 `push_result`。
-
-### D. 用户要"加 stock_picker job"（已有公式）
-1. `cli.py add <id> --task-type stock_picker --from preset:stock_picker_value`
-2. **必须询问用户企微 webhook URL**（`"你的企微机器人 webhook 地址是什么？"`）
-   - 用户提供了 → `cli.py set <id> notification.wecom.webhook <url>` + `cli.py set <id> notification.wecom.enabled true`
-   - 用户明确不配 / 暂时跳过 → `cli.py set <id> notification.wecom.enabled false`，并告知：**「企微推送已关闭，任务会跑但不推送；后续可用 `cli.py set <id> notification.wecom.webhook <url>` + `set ... enabled true` 开启」**
-3. `cli.py set <id> schedule.cron "*/30 9-15 * * 1-5"`
-4. `cli.py set <id> report.report_mode incremental`
-5. `cli.py run <id> --dry-run`（验证 selected[] 符合预期）
-6. `cli.py apply-schedule <id>`
-
-### E. 用户要"加 stock_picker job"（没有公式）
-1. `cli.py add <id> --task-type stock_picker --scaffold` 建空骨架
-2. 在对话里调 quant-buddy-skill，走 quant-standard.md：confirmDataMulti → 组装 formulas
-3. `cli.py set <id> formulas '<公式数组>'`
-4. `cli.py set <id> result_handler '<handler JSON>'`
-5. 走 D 步骤 2-6
-
-### F. 用户问"今天怎么没提醒"
-1. `cli.py diagnose <id>` → enabled / last_run / scheduler_status / cooldown_hits（仅 signal_monitor）/ quant_buddy_reachable
-2. 翻译给用户
-
-### G. 用户要"删除 job"
-1. **先向用户确认**：「即将删除 `<id>`，这会同时：① 从 Windows 任务计划删除 `ScheduledTask_<id>` ② 删除 `jobs/<id>/` 整个目录（含历史/日志/报告）③ 从 `registry.json` 移除记录。确认继续吗？」
-2. 用户确认后执行：`cli.py delete <id> --yes`
-3. 验证：输出 `ok: true` 即三步均已完成；如需手动验证可运行 `schtasks /Query /TN ScheduledTask_<id>`（应返回错误，说明已删除）
-
----
-
-## job.json 公共字段（两种 task_type 都有）
-
-`task_type` 缺省时默认 `signal_monitor`（向后兼容）。
-`push_when`：`triggered_only`（有结果才推）| `always`（每次都推，包括 0 条）。
-`report_mode`：`overwrite`（每天一份）| `incremental`（带时间戳，盘中多次推荐）。
-`schedule.cron` 优先于 `schedule.time`；支持 `*/30 9-15 * * 1-5`（工作日 9-15 时每 30 分钟）。
-`schedule.task_name` 留空时由 CLI 自动填为 `ScheduledTask_<id>`。
-
----
-
-## 目录结构
-
-```
-{SKILL_ROOT}/
-├── SKILL.md
-├── scripts/
-│   └── cli.py                       唯一入口（所有 stdout 都是 JSON）
-├── lib/
-│   ├── job_schema.py                load/save/set/backup/rollback
-│   ├── scanner.py                   signal_monitor + stock_picker 执行逻辑
-│   ├── asset_source.py              signal_monitor 资产池 loader
-│   ├── cooldown.py                  冷静期状态读写
-│   ├── wecom.py                     企微推送
-│   ├── scheduler_win.py             schtasks 包装（ScheduledTask_ 前缀）
-│   ├── validator.py                 schema 校验
-│   ├── reporter.py                  报告渲染（按 task_type 选模板/格式）
-│   └── quant_buddy.py               动态发现 quant-buddy-skill
-├── jobs/
-│   ├── registry.json
-│   ├── _presets/
-│   │   ├── dip_2sigma.json          signal_monitor: MA20-2σ 布林下轨
-│   │   ├── breakout_20d.json        signal_monitor: 20日突破
-│   │   ├── macd_cross.json          signal_monitor: MACD 金叉
-│   │   └── stock_picker_value.json  stock_picker: PE<15+股息率>3% Top10（已验证）
-│   └── <job_id>/
-│       ├── job.json
-│       ├── assets.xlsx              （仅 signal_monitor, type=excel 时）
-│       ├── .history/
-│       ├── state/
-│       │   ├── triggered.json       （仅 signal_monitor 冷静期）
-│       │   ├── last_result.json
-│       │   └── logs/
-│       └── output/reports/
-└── templates/
-    ├── default_report.md            signal_monitor 报告模板
-    └── stock_picker_report.md       stock_picker TopN 表格模板
-```
-
----
-
-## signal_monitor 场景（原有功能，完全兼容）
-
-job.json 格式、公式写法、资产池管理、冷静期、analysis_hook 与原 signal-monitor 完全兼容。
-`apply-schedule` 会自动迁移旧 `SignalMonitor_<id>` → `ScheduledTask_<id>`。
-
-signal_monitor job.json 关键字段：
-- `signal.formulas`：LLM 写中文公式，第一条必须含 `{ASSETS}` 占位符
-- `signal.trigger_formula`：哪条公式的布尔结果决定"触发"
-- `signal.display_fields`：报告展示列
-- `analysis_hook.enabled`：true 时 scanner 标 `pending_analysis=true`，LLM 外层完成 WebSearch + 分析
-- `signal.category`：`direction`（buy/sell/watch）+ `label`（自由文本子类型）
-
-| 信号名 | preset | 触发条件 |
-|--------|--------|----------|
-| R4A 短线抄底 | `dip_2sigma` | 收盘价 < MA20 − 2×STD20 |
-| R4B 中线稳健 | `dip_2sigma_60d` | 收盘价 < MA60 − 2×STD60 |
-| 20日突破 | `breakout_20d` | 收盘价 > 近20日最高 |
-| MACD金叉 | `macd_cross` | DIF 上穿 DEA |
-
----
-
-## stock_picker 场景（新增）
-
-`jobs/_presets/stock_picker_value.json` 内置已验证的 PE+股息率 Top10 公式（字段名来自 quant-buddy confirmDataMulti 实测，全角括号、中文逗号等原文保留）。
-
-**快速建任务**：
-```bash
-python scripts/cli.py add high-yield-low-pe --task-type stock_picker --from preset:stock_picker_value
-python scripts/cli.py set high-yield-low-pe notification.wecom.webhook "https://..."
-python scripts/cli.py run high-yield-low-pe --dry-run
-python scripts/cli.py apply-schedule high-yield-low-pe
-```
-
-**自定义公式（入口 B）**：
-```bash
-python scripts/cli.py add my-picker --task-type stock_picker --scaffold
-# 在对话里调 quant-buddy-skill 生成公式
-python scripts/cli.py set my-picker formulas '["公式1","公式2","公式3"]'
-python scripts/cli.py set my-picker result_handler \
-  '{"mode":"topn_by_mask","result_formula":"Top结果","value_columns":[{"label":"字段","from":"公式名","format":"{:.2f}"}],"sort_by":"字段","sort_order":"desc","limit":10}'
-python scripts/cli.py run my-picker --dry-run
-python scripts/cli.py apply-schedule my-picker
-```
-
----
-
-## 资产参考库（仅 signal_monitor 需要）
-
-资产信息来自 quant-buddy-skill 内置库：
-```
-quant-buddy-skill/presets/assets_db/
-├── stock_a.yaml   # A 股（沪深京）
-├── stock_hk.yaml  # 港股
-└── stock_us.yaml  # 美股（.O=NASDAQ / .N=NYSE / .A=AMEX）
-```
-
-生成 `assets.xlsx`（两列无表头）：
-```python
-import openpyxl
-wb = openpyxl.Workbook()
-ws = wb.active
-for company, ticker in selected_assets:
-    ws.append([company, ticker])
-wb.save("jobs/<id>/assets.xlsx")
-```
-
----
-
-## 关键约束 & 心智模型
-
-- **stdout 永远是 JSON** —— LLM 直接 `json.loads`，stderr 给人看
-- **set 永远先备份** —— 自动 snapshot 到 `.history/`，可 `rollback`
-- **dry-run 是安全档** —— 用户说"试一下/看看"统统加 `--dry-run`
-- **stock_picker 运行时无 LLM** —— 公式已物化存在 job.json，schtasks 触发时纯执行
-- **公式语义归 quant-buddy** —— scheduled-task 不知道"全A股""PE""股息率"是什么，只透传字符串
-- **任务名前缀** —— `ScheduledTask_<id>`（apply-schedule 自动迁移旧 `SignalMonitor_<id>`）
+> 完整 CLI 速查表、工作流 A-G 见 [docs/cli-reference.md](docs/cli-reference.md)。
