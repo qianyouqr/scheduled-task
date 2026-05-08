@@ -153,7 +153,7 @@ python {SKILL_ROOT}/scripts/cli.py load-cooldown <id>
 冷静期内 {M} 只：{ticker1名、ticker2名...}（最多列 5 只，超过则写"等 M 只"）
 ```
 
-> `push_when = "on_trigger"` 时，无新增触发则**跳过步骤 10**（不推送），直接进入步骤 11。
+> `push_when = "triggered_only"` 时，无新增触发则**跳过步骤 10**（不推送），直接进入步骤 11。
 
 #### stock_picker
 
@@ -207,7 +207,7 @@ python {SKILL_ROOT}/scripts/cli.py save-result <id> --file <result.json>
 1. **顺序锁定**：步骤 5–9 之间存在数据依赖，**不可并行**。步骤 10 必须在步骤 8/9 之后，步骤 11 必须在步骤 10 成功之后。
 2. **不要绕过 quant-buddy-skill**：跑公式必须走 `runMultiFormulaBatch` 原生工具；不要 import `quant_api`，不要拷贝公式去别处算。
 3. **不要猜公式**：`job.signal.formulas` / `job.formulas` 是声明式真相源，原样使用，不改写、不优化。
-4. **推送失败不写冷静期**：`push.ok != true` 时禁止调 `mark-triggered`，下次定时仍能重推。`push_when = "on_trigger"` 且无新增触发时，跳过步骤 10（不推送）也视为正常流程，可继续执行步骤 11。
+4. **推送失败不写冷静期**：`push.ok != true` 时禁止调 `mark-triggered`，下次定时仍能重推。`push_when = "triggered_only"` 且无新增触发时，跳过步骤 10（不推送）也视为正常流程，可继续执行步骤 11。
 5. **单次调用完成**：必须在本次 `claude -p` 内跑完 13 步。失败时把异常写到 `state/logs/YYYYMMDD.log` 后 exit。
 6. **不要触发 schtasks**：本次执行不要调 `cli.py apply-schedule` / `pause` / `resume` / `delete`。
 7. **不要重写 job.json**：所有运行时副作用只写 `jobs/<id>/state/` 和 `jobs/<id>/output/`（即 job 目录内部），不要写 SKILL_ROOT 级别的共享目录。

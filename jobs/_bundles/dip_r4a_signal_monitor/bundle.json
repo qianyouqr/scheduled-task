@@ -1,0 +1,59 @@
+{
+  "id": "",
+  "name": "R4A 抄底监控",
+  "description": "收盘价 < MA20 - 2×STD20 时触发（R4A 抄底信号），WebSearch 归因，价格/价值框架判断，7 天冷静期去重",
+  "task_type": "signal_monitor",
+  "enabled": true,
+  "asset_source": {
+    "type": "excel",
+    "path": "assets.xlsx",
+    "disabled_tickers": []
+  },
+  "signal": {
+    "category": {"direction": "buy", "label": "抄底", "description": "20日布林下轨跌破"},
+    "formulas": [
+      {"name": "资产池收盘价", "expression": "资产池构造({ASSETS}) * \"全市场每日收盘价\""},
+      {"name": "MA20",         "expression": "平均(\"资产池收盘价\", 20)"},
+      {"name": "下轨",         "expression": "\"MA20\" - 2 * 标准差(\"资产池收盘价\", 20)"},
+      {"name": "信号",         "expression": "\"资产池收盘价\" < \"下轨\""}
+    ],
+    "trigger_formula": "信号",
+    "display_fields": ["资产池收盘价", "MA20", "下轨"],
+    "lookback_days": 60
+  },
+  "cooldown_days": 7,
+  "analysis_hook": {
+    "enabled": true,
+    "framework_doc": "references/抄底判断框架.md",
+    "websearch_template": {
+      "A": "{company} 近期下跌 原因",
+      "HK": "{company} 下跌",
+      "US": "{ticker} selloff reasons"
+    },
+    "output_sections": ["下跌归因", "框架分类", "抄底结论"]
+  },
+  "notification": {
+    "wecom": {
+      "enabled": true,
+      "webhook": "",
+      "mentioned_list": [],
+      "mentioned_mobile_list": []
+    },
+    "push_when": "triggered_only"
+  },
+  "schedule": {
+    "enabled": true,
+    "cron": null,
+    "time": "08:30",
+    "task_name": ""
+  },
+  "report": {
+    "output_dir": "output/reports",
+    "report_mode": "overwrite",
+    "job_template": "templates/报告模板.md"
+  },
+  "context": {
+    "run_sop": "",
+    "references": ["references/抄底判断框架.md"]
+  }
+}

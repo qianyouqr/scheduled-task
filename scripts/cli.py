@@ -5,7 +5,7 @@
 子命令：
   list                                              列出所有 job
   show <id>                                         单 job 配置 + 上次结果摘要
-  add <id> --task-type T --from preset:<name>|<file>  新增 job（从模板）
+  add <id> --task-type T --from preset:<name>|bundle:<name>|<file>  新增 job（从模板/bundle）
   add <id> --task-type T --scaffold                   新增空骨架（无公式）
   add <id> --task-type T --formulas-file <file>       新增 job（读公式文件）
   delete <id> [--yes]                               删除 job 目录 + 调度
@@ -122,6 +122,8 @@ def cmd_add(args):
     if os.path.exists(job_schema.job_file(args.id)):
         _err(f"job 已存在: {args.id}")
 
+    bundle_dir_src = None  # bundle 模式时指向 bundle 根目录
+
     if args.scaffold:
         # 建空骨架：task_type 必须由 --task-type 指定
         task_type = args.task_type or "signal_monitor"
@@ -134,7 +136,7 @@ def cmd_add(args):
             "result_handler": {} if task_type == "stock_picker" else None,
             "runMultiFormula_args": {"begin_date": "auto_minus_60d", "use_minute_data": True} if task_type == "stock_picker" else None,
             "cooldown_days": 0 if task_type == "stock_picker" else 7,
-            "notification": {"wecom": {"enabled": True, "webhook": "", "mentioned_list": [], "mentioned_mobile_list": []}, "push_when": "always"},
+            "notification": {"wecom": {"enabled": True, "webhook": "", "mentioned_list": [], "mentioned_mobile_list": []}, "push_when": "always" if task_type == "stock_picker" else "triggered_only"},
             "schedule": {"enabled": True, "cron": None, "time": "08:30", "task_name": ""},
             "report": {"output_dir": "output/reports", "report_mode": "incremental" if task_type == "stock_picker" else "overwrite"},
         }
@@ -162,7 +164,11 @@ def cmd_add(args):
         src = args.from_
         if not src:
             _err("需要 --from, --scaffold, 或 --formulas-file")
-        if src.startswith("preset:"):
+        if src.startswith("bundle:"):
+            bundle_name = src.split(":", 1)[1]
+            bundle_dir_src = os.path.join(SKILL_ROOT, "jobs", "_bundles", bundle_name)
+            path = os.path.join(bundle_dir_src, "bundle.json")
+        elif src.startswith("preset:"):
             name = src.split(":", 1)[1]
             path = os.path.join(SKILL_ROOT, "jobs", "_presets", f"{name}.json")
         else:
@@ -180,6 +186,65 @@ def cmd_add(args):
 
     job_schema.save_job(args.id, data, backup=False)
     job_dir = job_schema.job_dir(args.id)
+
+    # ── bundle 模式：自动复制资产池、模板、参考资料、run_sop ──────────
+    bundle_copied_assets = None
+    if bundle_dir_src:
+        # assets/ → jobs/<id>/assets.xlsx（取第一个文件）
+        b_assets = os.path.join(bundle_dir_src, "assets")
+        if os.path.isdir(b_assets):
+            for fname in os.listdir(b_assets):
+                src_f = os.path.join(b_assets, fname)
+                dst_f = os.path.join(job_dir, fname)
+                shutil.copy2(src_f, dst_f)
+                bundle_copied_assets = fname
+            # 若 bundle.json 里 asset_source.path 已配置则不覆盖
+            if not (data.get("asset_source") or {}).get("path"):
+                data.setdefault("asset_source", {}).update(
+                    {"type": "excel", "path": bundle_copied_assets, "disabled_tickers": []}
+                )
+                job_schema.save_job(args.id, data, backup=False)
+
+        # templates/ → jobs/<id>/templates/（若未传 --template-file）
+        if not args.template_file:
+            b_tpl = os.path.join(bundle_dir_src, "templates")
+            if os.path.isdir(b_tpl):
+                tpl_dir = os.path.join(job_dir, "templates")
+                os.makedirs(tpl_dir, exist_ok=True)
+                first_tpl = None
+                for fname in os.listdir(b_tpl):
+                    shutil.copy2(os.path.join(b_tpl, fname), os.path.join(tpl_dir, fname))
+                    if first_tpl is None:
+                        first_tpl = "templates/" + fname
+                # 若 bundle.json 里 report.job_template 已配置则不覆盖
+                if first_tpl and not (data.get("report") or {}).get("job_template"):
+                    data.setdefault("report", {})["job_template"] = first_tpl
+                    job_schema.save_job(args.id, data, backup=False)
+
+        # references/ → jobs/<id>/references/（若未传 --reference-files）
+        if not args.reference_files:
+            b_refs = os.path.join(bundle_dir_src, "references")
+            if os.path.isdir(b_refs):
+                ref_dir = os.path.join(job_dir, "references")
+                os.makedirs(ref_dir, exist_ok=True)
+                ref_paths = []
+                for fname in os.listdir(b_refs):
+                    shutil.copy2(os.path.join(b_refs, fname), os.path.join(ref_dir, fname))
+                    ref_paths.append("references/" + fname)
+                # 若 bundle.json 里 context.references 已配置则不覆盖
+                if ref_paths and not (data.get("context") or {}).get("references"):
+                    data.setdefault("context", {})["references"] = ref_paths
+                    job_schema.save_job(args.id, data, backup=False)
+
+        # run_sop.md → job.context.run_sop（若未传 --run-sop 且 bundle.json 里为空）
+        if not args.run_sop:
+            b_sop = os.path.join(bundle_dir_src, "run_sop.md")
+            if os.path.exists(b_sop) and not (data.get("context") or {}).get("run_sop"):
+                with open(b_sop, "r", encoding="utf-8") as f:
+                    sop_text = f.read().strip()
+                if sop_text:
+                    data.setdefault("context", {})["run_sop"] = sop_text
+                    job_schema.save_job(args.id, data, backup=False)
 
     # ── 复制 job 级别模板 ──────────────────────────────────────
     copied_template = None
@@ -234,6 +299,14 @@ def cmd_add(args):
             f"cli.py set {args.id} schedule.cron \"*/30 9-15 * * 1-5\"",
             f"cli.py apply-schedule {args.id}",
         ]
+    elif bundle_copied_assets:
+        # bundle 已自动配好资产池，跳过 set asset_source 步骤
+        next_steps = [
+            f"cli.py set {args.id} notification.wecom.webhook <webhook_url>",
+            f"cli.py set {args.id} schedule.cron \"*/20 * * * *\"",
+            f"cli.py validate {args.id}",
+            f"cli.py apply-schedule {args.id}",
+        ]
     else:
         next_steps = [
             f"cli.py set {args.id} asset_source.type excel",
@@ -245,6 +318,7 @@ def cmd_add(args):
         "ok": True, "id": args.id, "task_type": task_type,
         "copied_template": copied_template,
         "copied_references": copied_refs,
+        "bundle_assets": bundle_copied_assets,
         "next": next_steps,
     })
 
@@ -621,7 +695,7 @@ def build_parser():
     sp = sub.add_parser("show"); sp.add_argument("id"); sp.set_defaults(func=cmd_show)
 
     sp = sub.add_parser("add"); sp.add_argument("id")
-    sp.add_argument("--from", dest="from_", default=None, help="preset:<name> 或文件路径")
+    sp.add_argument("--from", dest="from_", default=None, help="preset:<name>、bundle:<name> 或文件路径")
     sp.add_argument("--task-type", dest="task_type", default=None, help="signal_monitor 或 stock_picker")
     sp.add_argument("--scaffold", action="store_true", help="建空骨架（无公式）")
     sp.add_argument("--formulas-file", dest="formulas_file", default=None, help="从 JSON 文件读取公式")

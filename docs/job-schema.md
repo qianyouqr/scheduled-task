@@ -13,12 +13,14 @@ skill_dir/scheduled-task/
 │   ├── cli-reference.md      # CLI 速查 + 工作流 A-G
 │   └── job-schema.md         # 本文件：公共字段 + 约束
 ├── jobs/
+│   ├── _bundles/             # 打包任务模板（bundle）；每个子目录含 bundle.json + assets/ + references/ + templates/ + run_sop.md
+│   │   └── dip_r4a_signal_monitor/   # R4A 抄底信号监控 bundle（含资产池文件、抄底判断框架、报告模板）
 │   └── <job_id>/
 │       ├── job.json          # 任务配置（由 cli.py 生成和维护）
 │       ├── assets.xlsx       # 资产池文件（推荐，excel 类型时）
 │       ├── assets.csv        # 资产池文件（csv 类型时）
-│       ├── templates/        # job 级别报告模板（--template-file 复制到此；agent 写报告时优先用）
-│       ├── references/       # 参考资料文件（--reference-files 复制到此；agent 步骤1b读取为背景知识）
+│       ├── templates/        # job 级别报告模板（--template-file 或 bundle 自动复制；agent 写报告时优先用）
+│       ├── references/       # 参考资料文件（--reference-files 或 bundle 自动复制；agent 步骤1b读取为背景知识）
 │       ├── state/            # 冷静期状态、上次运行结果
 │       └── .history/         # job.json 备份
 ├── lib/

@@ -51,7 +51,58 @@ metadata:
   生成公式（走 quant-standard.md 流程），最后 `cli.py set ... formulas <list>` 写回。
   CLI 不内置 LLM，公式生成发生在对话层。
 
+### 创建阶段跨 skill 编排硬规则
+
+当用户在同一句话里同时提出「量化信号/筛选条件」和「创建定时任务/监控/推送」时，必须按下面顺序执行：
+
+1. **先用 quant-buddy-skill 生成并验证公式**：把用户的资产池、字段口径、阈值、窗口参数原样交给 quant-buddy-skill；拿到可运行的公式链后，再进入 scheduled-task 创建流程。
+2. **再用 scheduled-task 落 job**：把上一步公式链写入 `job.json`，scheduled-task 只负责调度、推送、报告和运行时透传。
+3. **不得用 bundle/preset 公式替代用户条件**：bundle/preset 只能作为骨架。只要用户条件与模板内置条件不同，必须覆盖 `description`、`signal.category.description`、`signal.formulas`、`signal.trigger_formula`、`signal.display_fields`、`signal.lookback_days` 等字段。
+4. **用户给了资产池文件时，以用户文件为准**：若使用 bundle 创建 job，bundle 自带 `assets.xlsx` 只能作为缺省资产池；用户显式提供 `assets.xlsx` / `csv` 路径时，必须复制该文件到 `jobs/<id>/assets.xlsx`（或同名文件）并配置 `asset_source.type/path` 指向复制后的文件。
+5. **上文复用必须有显式公式证据**：用户说「把上面的工作创建成定时任务」时，先从本对话可见上下文提取上一轮的公式链；若上一轮只有结果名单、没有显式公式链，必须重新调用 quant-buddy-skill 生成公式，禁止凭记忆、自然语言条件或 bundle 默认公式猜写。
+
+推荐的公式交接格式（对话层产物）：
+
+```json
+{
+  "task_type": "signal_monitor",
+  "condition_text": "C < MA20 - 1.5*ATR20",
+  "signal": {
+    "formulas": [
+      {"name": "资产池收盘价", "expression": "..."},
+      {"name": "信号", "expression": "..."}
+    ],
+    "trigger_formula": "信号",
+    "display_fields": ["资产池收盘价", "MA20", "ATR20", "下轨"],
+    "lookback_days": 60
+  }
+}
+```
+
 **运行时架构（v2 — agent path）**：schtasks 触发 `_run.bat` → 启动 `claude -p` → agent 按 [docs/agent-runtime-flow.md](docs/agent-runtime-flow.md) 的 13 步流跑完 job：读 job → load-assets → load-cooldown → 调 quant-buddy-skill 的 `runMultiFormulaBatch` 跑公式 → 末日值/TopN → 触发判定 →（有触发时 WebSearch 归因）→ 写 markdown 报告 → push 到企微 → push 成功后才 mark-triggered。CLI 只提供原语命令（`load-assets` / `load-cooldown` / `mark-triggered` / `push` / `save-result` / `save-report`），不再提供 `run` / `trigger` 这种「一键全跑」的 Python 包装 —— 老路径会绕过 quant-buddy-skill 的 SOP 和 agent 的归因能力。
+
+---
+
+## 可用 Bundle（打包任务模板）
+
+Bundle = 一整套打法的打包，含 job 骨架（公式已写好）+ 资产池文件 + 参考资料 + 报告模板 + 执行 SOP。  
+用 `--from bundle:<name>` 创建时，所有文件自动复制到 `jobs/<id>/`，无需手动传路径。
+
+| bundle 名 | task_type | 适用场景 | 典型触发语 |
+|---|---|---|---|
+| `dip_r4a_signal_monitor` | signal_monitor | A 股固定资产池跌破 MA20−2σ 抄底信号监控 + WebSearch 归因 + 价格/价值框架判断 | 跌破下轨、抄底信号、R4A、2σ 抄底、核心资产跌破 |
+
+**一句话创建**（以 `dip_r4a_signal_monitor` 为例）：
+
+```bash
+python scripts/cli.py add <job_id> --from bundle:dip_r4a_signal_monitor
+python scripts/cli.py set <job_id> notification.wecom.webhook "https://..."
+python scripts/cli.py set <job_id> schedule.cron "*/20 * * * *"
+python scripts/cli.py apply-schedule <job_id>
+# 立即跑一次：在对话里让 agent 按 docs/agent-runtime-flow.md 的 13 步流执行
+```
+
+> Bundle 与 preset 的区别：preset 只有 job.json 骨架（公式），bundle 额外携带资产池文件、参考资料、报告模板、执行 SOP。
 
 ---
 
@@ -160,6 +211,8 @@ metadata:
    │                          （不要再找 cli run / trigger，它们已被删除）
    ├─ 推送测试             → cli test-push <id>
    ├─ 改字段               → cli set <id> <jsonpath> <value>   （写入前自动备份）
+   ├─ 加 job（有公式，有打包打法）→ cli add <id> --from bundle:<name>
+   │                          自动复制资产池/模板/参考资料/SOP，只需再 set webhook + cron
    ├─ 加 job（有公式）     → cli add <id> --task-type <type> --from preset:<name>
    │                          或 --formulas-file <formulas.json>
    │                          [--template-file 报告模板.md]（复制到 jobs/<id>/templates/）

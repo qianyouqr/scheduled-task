@@ -33,7 +33,7 @@
 |------|------|
 | `python scripts/cli.py list` | 列出所有 job |
 | `python scripts/cli.py show <id>` | 查看 job 完整配置 + 上次运行结果 |
-| `python scripts/cli.py add <id> --task-type <type> [--from preset:<name>] [--scaffold] [--formulas-file <f>]` | 新建 job |
+| `python scripts/cli.py add <id> --task-type <type> [--from preset:<name>|bundle:<name>] [--scaffold] [--formulas-file <f>]` | 新建 job（bundle 自动复制资产池/模板/参考资料/SOP） |
 | `python scripts/cli.py delete <id> --yes` | 删除 job 目录 + 定时任务 |
 | `python scripts/cli.py set <id> <jsonpath> <value>` | 修改字段（如 `signal.trigger_formula`、`schedule.cron`） |
 | `python scripts/cli.py disable-asset <id> <ticker>` | 把 ticker 加入黑名单 |
@@ -54,7 +54,7 @@
 | `python scripts/cli.py load-cooldown <id>` | 输出 `cooled_tickers[]` 供过滤 | 步骤 3 |
 | `python scripts/cli.py mark-triggered <id> --tickers T1,T2` | 推送成功后写冷静期 | 步骤 11 |
 | `python scripts/cli.py push <id> --report-file <md>` | 读 markdown 推到企微（也支持 `--content "<text>"`） | 步骤 10 |
-| `python scripts/cli.py save-report <id> --file <md>` | 按 `report.report_mode` 落到 `output/reports/<id>/` | 步骤 12 |
+| `python scripts/cli.py save-report <id> --file <md>` | 按 `report.report_mode` 落到 `jobs/<id>/<report.output_dir>/`（默认 `jobs/<id>/output/reports/`） | 步骤 12 |
 | `python scripts/cli.py save-result <id> --file <json>` | 把本轮结果写到 `state/last_result.json` | 步骤 13 |
 
 > **所有 stdout 都是 JSON**；人类可读消息走 stderr。
@@ -63,7 +63,24 @@
 
 ## 工作流
 
-### 工作流 A — 快速建 signal_monitor（preset）
+### 工作流 A — 快速建 signal_monitor
+
+#### A-0 用 bundle（推荐）：公式 + 资产池 + 模板 + 参考资料 + SOP 一次性到位
+
+```bash
+# bundle 自动复制 assets.xlsx、references/、templates/、写入 run_sop
+python scripts/cli.py add <id> --from bundle:dip_r4a_signal_monitor
+python scripts/cli.py set <id> notification.wecom.webhook "https://..."
+python scripts/cli.py set <id> notification.wecom.enabled true
+python scripts/cli.py set <id> schedule.cron "*/20 * * * *"
+python scripts/cli.py validate <id>
+# 立即试跑：在对话里让 agent 按 docs/agent-runtime-flow.md 走 13 步
+python scripts/cli.py apply-schedule <id>
+```
+
+> 可用 bundle 列表见 SKILL.md「可用 Bundle」小节。
+
+#### A-1 用 preset（有公式，手动配资产池）
 
 ```bash
 # 若有 job 级别报告模板和参考资料，在 add 时一并传入，cli 会复制到 templates/ 和 references/ 子目录
@@ -84,21 +101,53 @@ python scripts/cli.py apply-schedule <id>
 
 ### 工作流 B — 自定义公式 signal_monitor
 
+适用：用户给了自然语言信号条件，或说「把上面的工作创建成定时任务」，但不是现有 preset/bundle 的原始条件。
+
+创建前必须先确认公式来源：
+- 上文已有显式公式链 → 直接提取并写入。
+- 上文只有结果名单 / 本轮只有自然语言条件 → 先调用 quant-buddy-skill 生成并验证公式链。
+- 想复用 `dip_r4a_signal_monitor` 的报告/归因框架 → 可以先 `--from bundle:dip_r4a_signal_monitor`，但必须立刻覆盖 `signal.*` 公式字段；不得保留 bundle 默认 `MA20 - 2*STD20` 公式。
+
 ```bash
 # 若有 job 级别报告模板或参考资料（归因框架文档等），在 add 时传入
 python scripts/cli.py add <id> --task-type signal_monitor --scaffold \
   [--template-file path/to/报告模板.md] \
   [--reference-files path/to/框架.md,path/to/其他参考.md] \
   [--run-sop "额外运行约束文本"]
-# 对话层调 quant-buddy-skill 生成公式
+
+# 对话层调 quant-buddy-skill 生成并验证公式，输出 formulas / trigger_formula / display_fields / lookback_days
 python scripts/cli.py set <id> signal.formulas '[{"name":"...","expression":"..."}]'
 python scripts/cli.py set <id> signal.trigger_formula "信号"
 python scripts/cli.py set <id> signal.display_fields '["字段1","字段2"]'
+python scripts/cli.py set <id> signal.lookback_days 60
 python scripts/cli.py set <id> asset_source.type excel
 python scripts/cli.py set <id> asset_source.path assets.xlsx
 python scripts/cli.py set <id> notification.wecom.webhook "https://..."
 python scripts/cli.py set <id> notification.wecom.enabled true
 python scripts/cli.py set <id> schedule.cron "*/30 9-15 * * 1-5"
+python scripts/cli.py validate <id>
+python scripts/cli.py apply-schedule <id>
+```
+
+#### 工作流 B-1 — 自定义公式但复用 bundle 骨架
+
+```bash
+python scripts/cli.py add <id> --from bundle:dip_r4a_signal_monitor
+# 若用户提供了资产池文件，复制到 jobs/<id>/assets.xlsx 后确保：
+python scripts/cli.py set <id> asset_source.type excel
+python scripts/cli.py set <id> asset_source.path assets.xlsx
+
+# 覆盖 bundle 默认信号，写入 quant-buddy-skill 生成的公式包
+python scripts/cli.py set <id> description "<用户原始条件描述>"
+python scripts/cli.py set <id> signal.category.description "<用户原始条件>"
+python scripts/cli.py set <id> signal.formulas '[{"name":"...","expression":"..."}]'
+python scripts/cli.py set <id> signal.trigger_formula "信号"
+python scripts/cli.py set <id> signal.display_fields '["资产池收盘价","MA20","ATR20","下轨"]'
+python scripts/cli.py set <id> signal.lookback_days 60
+
+python scripts/cli.py set <id> notification.wecom.webhook "https://..."
+python scripts/cli.py set <id> notification.wecom.enabled true
+python scripts/cli.py set <id> schedule.cron "*/18 * * * *"
 python scripts/cli.py validate <id>
 python scripts/cli.py apply-schedule <id>
 ```
@@ -167,10 +216,12 @@ agent 应当按 [agent-runtime-flow.md](agent-runtime-flow.md) 的 13 步流执�
 6. 提取末日值 / TopN
 7. 触发判定 + 冷静期过滤
 8. （signal_monitor 且 analysis_hook.enabled）WebSearch 归因
-9. 按 templates/agent_report.md 写 markdown
-10. cli push <id> --report-file <md>
+9. 按 report.job_template 优先，否则全局 {SKILL_ROOT}/templates/agent_report.md 写 markdown
+   → 写到 jobs/<id>/state/_pending_report.md
+9.5. 生成企微精简推送稿 → 写到 jobs/<id>/state/_pending_push.md
+10. cli push <id> --report-file jobs/<id>/state/_pending_push.md
 11. （signal_monitor 且推送成功）cli mark-triggered <id> --tickers ...
-12. cli save-report <id> --file <md>
+12. cli save-report <id> --file jobs/<id>/state/_pending_report.md
 13. cli save-result <id> --file <result.json>
 ```
 

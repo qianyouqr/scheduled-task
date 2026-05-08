@@ -88,6 +88,20 @@
 
 ### 创建带文件资产池的完整步骤
 
+### 创建带文件资产池的完整步骤
+
+> **推荐（有可用 bundle）**：若存在匹配的 bundle（见 SKILL.md 可用 Bundle 列表），用 `--from bundle:<name>` 一键创建，资产池文件自动复制，无需下列步骤 1-3。
+>
+> ```bash
+> python scripts/cli.py add <id> --from bundle:dip_r4a_signal_monitor
+> # bundle 已自动：复制 assets.xlsx + references/ + templates/ + 写入 run_sop
+> python scripts/cli.py set <id> notification.wecom.webhook "https://..."
+> python scripts/cli.py set <id> schedule.cron "*/20 * * * *"
+> python scripts/cli.py apply-schedule <id>
+> ```
+
+**手动创建步骤**（无合适 bundle 时）：
+
 ```bash
 # 1. 建 job 骨架
 python scripts/cli.py add <id> --task-type signal_monitor --from preset:dip_2sigma
@@ -160,6 +174,44 @@ python scripts/cli.py validate <id>
 
 ## signal_monitor 创建完整流程
 
+### 创建前判定（必须先做）
+
+收到创建 signal_monitor 定时任务的请求后，先判定用户条件是否已经有**显式公式链**：
+
+| 用户输入状态 | 正确动作 |
+|-------------|----------|
+| 本轮或上文已有 `signal.formulas` / 公式链 JSON | 直接进入 scheduled-task 创建，把公式原样写入 job |
+| 只有自然语言条件（如 `C < MA20 - 1.5*ATR20`） | 先调用 quant-buddy-skill 生成并验证公式链，再创建 job |
+| 用户说「把上面的工作创建成定时任务」，且上文只有筛选结果名单 | 重新调用 quant-buddy-skill 生成公式链，禁止从名单反推 |
+| 用户说「把上面的工作创建成定时任务」，且上文已有公式链 | 提取该公式链，写入 job |
+
+**严禁**：用户给的是自定义条件时，直接套用 `dip_2sigma` / `dip_r4a_signal_monitor` 的默认公式收尾。模板只能提供骨架，不能替代用户条件。
+
+### 自定义条件使用 bundle 的覆盖规则
+
+若用户希望沿用 `dip_r4a_signal_monitor` 的报告模板、参考资料、归因 SOP，但信号条件不是 bundle 内置的 `收盘价 < MA20 - 2*STD20`，推荐仍可先用 bundle 建骨架，然后立即覆盖下面字段：
+
+```bash
+python scripts/cli.py add <id> --from bundle:dip_r4a_signal_monitor
+python scripts/cli.py set <id> description "<用户原始条件的任务描述>"
+python scripts/cli.py set <id> signal.category.description "<用户原始条件>"
+python scripts/cli.py set <id> signal.formulas '[{"name":"...","expression":"..."}]'
+python scripts/cli.py set <id> signal.trigger_formula "信号"
+python scripts/cli.py set <id> signal.display_fields '["资产池收盘价","MA20","ATR20","下轨"]'
+python scripts/cli.py set <id> signal.lookback_days 60
+```
+
+覆盖后必须 `python scripts/cli.py validate <id>`。验证失败时回到 quant-buddy-skill 修正公式，不要改回 bundle 默认公式。
+
+### 用户资产池文件优先级
+
+当用户显式提供资产池文件路径（例如 `D:\...\assets.xlsx`）时：
+
+1. 必须以该文件为准。
+2. 若使用 bundle 创建 job，必须用用户文件覆盖/替换 bundle 复制来的资产池文件。
+3. job 内配置保持相对路径，例如 `asset_source.type = excel`、`asset_source.path = assets.xlsx`。
+4. 若用户文件不是 scheduled-task 支持的两列格式，先说明格式问题并请求修正；不要静默改成 inline。
+
 ### 场景一：用已知 preset 快速建（推荐）
 
 ```bash
@@ -180,16 +232,46 @@ python scripts/cli.py apply-schedule <id>
 # 1. 建空骨架
 python scripts/cli.py add <id> --task-type signal_monitor --scaffold
 
-# 2. 调 quant-buddy-skill 生成 signal.formulas（对话层完成）
+# 2. 调 quant-buddy-skill 生成并验证 signal.formulas（对话层完成）
+#    输出必须至少包含：formulas / trigger_formula / display_fields / lookback_days
 
 # 3. 写入公式
 python scripts/cli.py set <id> signal.formulas '[{"name":"公式1","expression":"..."},...]'
 python scripts/cli.py set <id> signal.trigger_formula "信号"
 python scripts/cli.py set <id> signal.display_fields '["字段1","字段2"]'
+python scripts/cli.py set <id> signal.lookback_days 60
 
 # 4. 生成 assets.xlsx + 配置资产池（见资产池 SOP）
 
 # 5. 后续同场景一步骤 4-8
+```
+
+### ATR 条件示例（公式交接形态）
+
+对 `C < MA20 - 1.5*ATR20` 这类 ATR 波动率体系条件，公式链应由 quant-buddy-skill 确认后写入。常见形态如下（最终以 quant-buddy-skill 验证通过版本为准）：
+
+```json
+[
+  {"name": "资产池收盘价", "expression": "资产池构造({ASSETS}) * \"全市场每日收盘价\""},
+  {"name": "资产池最高价", "expression": "资产池构造({ASSETS}) * \"全市场每日最高价\""},
+  {"name": "资产池最低价", "expression": "资产池构造({ASSETS}) * \"全市场每日最低价\""},
+  {"name": "前收盘价", "expression": "前几天(\"资产池收盘价\", 1)"},
+  {"name": "TR", "expression": "比较取大(比较取大(\"资产池最高价\" - \"资产池最低价\", 绝对值(\"资产池最高价\" - \"前收盘价\")), 绝对值(\"资产池最低价\" - \"前收盘价\"))"},
+  {"name": "ATR20", "expression": "平均(\"TR\", 20)"},
+  {"name": "MA20", "expression": "平均(\"资产池收盘价\", 20)"},
+  {"name": "下轨", "expression": "\"MA20\" - 1.5 * \"ATR20\""},
+  {"name": "信号", "expression": "\"资产池收盘价\" < \"下轨\""}
+]
+```
+
+对应配置：
+
+```json
+{
+  "trigger_formula": "信号",
+  "display_fields": ["资产池收盘价", "MA20", "ATR20", "下轨"],
+  "lookback_days": 60
+}
 ```
 
 ---
