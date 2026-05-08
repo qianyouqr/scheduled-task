@@ -160,6 +160,7 @@ def _runner_path(job_id: str) -> str:
     )
     content = (
         "@echo off\r\n"
+        "chcp 65001 > nul\r\n"
         "setlocal\r\n"
         f'set "LOG_DIR={log_dir}"\r\n'
         f'set "CLAUDE_EXE={claude_exe}"\r\n'
