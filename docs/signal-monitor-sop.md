@@ -223,6 +223,9 @@ python scripts/cli.py set <id> notification.wecom.webhook "https://..."
 python scripts/cli.py set <id> notification.wecom.enabled true
 python scripts/cli.py set <id> schedule.cron "*/30 9-15 * * 1-5"
 python scripts/cli.py validate <id>
+# 生成执行态 SOP（必须在 apply-schedule 之前完成）
+python scripts/cli.py generate-workflow <id>
+# → 参考 docs/workflow-generation.md，生成 jobs/<id>/workflow.md
 python scripts/cli.py apply-schedule <id>
 ```
 
@@ -243,7 +246,11 @@ python scripts/cli.py set <id> signal.lookback_days 60
 
 # 4. 生成 assets.xlsx + 配置资产池（见资产池 SOP）
 
-# 5. 后续同场景一步骤 4-8
+# 5. 生成执行态 SOP
+python scripts/cli.py generate-workflow <id>
+# → 参考 docs/workflow-generation.md，生成 jobs/<id>/workflow.md
+
+# 6. 后续同场景一步骤（set webhook / validate / apply-schedule）
 ```
 
 ### ATR 条件示例（公式交接形态）

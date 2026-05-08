@@ -27,6 +27,9 @@
   diagnose <id>                                     解释"今天为什么没提醒"
   history <id>                                      列出 .history/ 备份
   rollback <id> [--to <ts>]                         回滚到指定备份（默认上一份）
+  run-formulas <id>                                 直连 quant_api 跑公式（执行态专用，不走 MCP 协议）
+                                                    输出 {triggered/selected/errors/run_start_time} JSON
+  generate-workflow <id>                            输出 job 配置摘要，供 Agent 生成 jobs/<id>/workflow.md
 """
 
 import argparse
@@ -560,6 +563,238 @@ def cmd_test_push(args):
     _emit({"ok": res["ok"], "id": args.id, "push": res, "preview": text})
 
 
+def cmd_run_formulas(args):
+    """直连 quant_api 跑公式，输出完整结果 JSON（含触发/选股/冷静期）。
+
+    执行态专用：不走 MCP 协议，省去 quant-buddy-skill 文档加载和 MCP 协议开销。
+    批次管理、begin_date 计算、{ASSETS} 替换、触发判定、冷静期过滤全部在此完成。
+    Claude 读取返回的 JSON 后执行归因、写报告、推送等后续步骤。
+    """
+    from datetime import timedelta
+
+    job = job_schema.load_job(args.id)
+    task_type = job.get("task_type", "signal_monitor")
+    state_dir = _state_dir(args.id)
+    job_dir_path = job_schema.job_dir(args.id)
+    today = date.today()
+    run_start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 初始化 quant_api（直连 HTTP，不走 MCP）
+    try:
+        from lib import quant_buddy
+        api = quant_buddy.get_api()
+    except Exception as e:
+        _err(f"quant_api 初始化失败: {type(e).__name__}: {e}")
+
+    try:
+        task_id = api.new_session()
+    except Exception as e:
+        _err(f"new_session 失败: {type(e).__name__}: {e}")
+
+    # 加载资产池（signal_monitor 需要；stock_picker 跳过）
+    assets = []
+    if task_type == "signal_monitor":
+        try:
+            assets = asset_source.load_assets(job.get("asset_source", {}), job_dir_path)
+        except Exception as e:
+            _err(f"加载资产池失败: {type(e).__name__}: {e}")
+        if not assets:
+            _err(f"资产池为空（job {args.id}），请先配置 asset_source")
+
+    # 加载冷静期
+    cooldown_days = int(job.get("cooldown_days", 0))
+    cooled_tickers: list = []
+    if task_type == "signal_monitor" and cooldown_days > 0:
+        cd_state = cooldown.load_state(state_dir)
+        for ticker, last in cd_state.items():
+            if cooldown.is_cooled_down(last, today, cooldown_days):
+                cooled_tickers.append(ticker)
+
+    # 准备公式列表（signal_monitor 替换 {ASSETS} 占位符）
+    if task_type == "signal_monitor":
+        signal = job.get("signal") or {}
+        raw_formulas = signal.get("formulas") or []
+        asset_names = ", ".join(a["company"] for a in assets)
+        formulas = []
+        for f in raw_formulas:
+            if isinstance(f, dict):
+                name = f.get("name", "")
+                expr = f.get("expression", "")
+            else:
+                parts = str(f).split("=", 1)
+                name = parts[0].strip()
+                expr = parts[1].strip() if len(parts) > 1 else ""
+            expr = expr.replace("{ASSETS}", asset_names)
+            formulas.append(f"{name} = {expr}")
+        lookback_days = int(signal.get("lookback_days", 60))
+        begin_date = (today - timedelta(days=int(lookback_days * 1.4))).strftime("%Y%m%d")
+    else:
+        formulas = list(job.get("formulas") or [])
+        rma = job.get("runMultiFormula_args") or {}
+        bd = rma.get("begin_date", "auto_minus_60d")
+        if isinstance(bd, int):
+            begin_date = str(bd)
+        elif bd == "auto_minus_120d":
+            begin_date = (today - timedelta(days=180)).strftime("%Y%m%d")
+        else:  # auto_minus_60d 或其他
+            begin_date = (today - timedelta(days=90)).strftime("%Y%m%d")
+
+    if not formulas:
+        _err(f"job {args.id} 无公式（formulas 为空）")
+
+    # 分批跑公式（单批 ≤10 条，共用 task_id，force_reusable_array=true）
+    BATCH_SIZE = 10
+    all_errors: list = []
+    all_results: list = []
+    merged_lcf: dict = {}  # last_column_full 合并
+
+    for i in range(0, len(formulas), BATCH_SIZE):
+        batch = formulas[i:i + BATCH_SIZE]
+        try:
+            result = api.run_multi_formula(
+                formulas=batch,
+                begin_date=int(begin_date),
+                task_id=task_id,
+                force_reusable_array=True,
+                use_minute_data=True,
+            )
+        except Exception as e:
+            all_errors.append({"batch_start": i, "error": f"{type(e).__name__}: {e}"})
+            continue
+        all_errors.extend(result.get("errors") or [])
+        all_results.extend(result.get("results") or [])
+        merged_lcf.update(result.get("last_column_full") or {})
+
+    # 提取末日值 / 触发判定 / TopN 排序
+    triggered: list = []
+    cooled_down: list = list(cooled_tickers)
+    selected: list = []
+
+    if task_type == "signal_monitor":
+        trigger_formula = (job.get("signal") or {}).get("trigger_formula", "信号")
+        entry = merged_lcf.get(trigger_formula) or {}
+        tickers_l = entry.get("tickers") or entry.get("ticker_list") or []
+        values_l = entry.get("values") or []
+        cooled_set = set(cooled_tickers)
+        for ticker, val in zip(tickers_l, values_l):
+            try:
+                v = float(val) if val is not None else 0.0
+            except (TypeError, ValueError):
+                v = 0.0
+            if v >= 0.5:
+                if ticker not in cooled_set:
+                    triggered.append(ticker)
+    else:
+        rh = job.get("result_handler") or {}
+        result_formula = rh.get("result_formula", "")
+        entry = merged_lcf.get(result_formula) or {}
+        tickers_l = entry.get("tickers") or entry.get("ticker_list") or []
+        values_l = entry.get("values") or []
+        value_columns = rh.get("value_columns") or []
+        candidates: list = []
+        for ticker, val in zip(tickers_l, values_l):
+            try:
+                v = float(val) if val is not None else 0.0
+            except (TypeError, ValueError):
+                v = 0.0
+            if v != 0:
+                row: dict = {"ticker": ticker, result_formula: val}
+                for vc in value_columns:
+                    vc_from = vc.get("from", "")
+                    vc_label = vc.get("label", vc_from)
+                    vc_entry = merged_lcf.get(vc_from) or {}
+                    vc_tickers = vc_entry.get("tickers") or vc_entry.get("ticker_list") or []
+                    vc_vals = vc_entry.get("values") or []
+                    if ticker in vc_tickers:
+                        idx = vc_tickers.index(ticker)
+                        row[vc_label] = vc_vals[idx] if idx < len(vc_vals) else None
+                    else:
+                        row[vc_label] = None
+                candidates.append(row)
+        sort_by = rh.get("sort_by", "")
+        sort_order = rh.get("sort_order", "desc")
+        if sort_by and candidates:
+            reverse = sort_order != "asc"
+
+            def _sort_key(r: dict) -> float:
+                val = r.get(sort_by)
+                try:
+                    return float(val) if val is not None else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+
+            candidates.sort(key=_sort_key, reverse=reverse)
+        limit = int(rh.get("limit", 50))
+        selected = candidates[:limit]
+
+    _emit({
+        "ok": True,
+        "id": args.id,
+        "task_type": task_type,
+        "run_start_time": run_start_time,
+        "today": today.strftime("%Y-%m-%d"),
+        "begin_date": begin_date,
+        "task_id": task_id,
+        "formula_count": len(formulas),
+        "batch_count": (len(formulas) + BATCH_SIZE - 1) // BATCH_SIZE,
+        "errors": all_errors,
+        "results_count": len(all_results),
+        # signal_monitor 结果（经冷静期过滤）
+        "triggered": triggered,
+        "cooled_down": cooled_down,
+        # stock_picker 结果（TopN，已按 sort_by 排序）
+        "selected": selected,
+        # 供 Claude 调试用
+        "last_column_full_keys": list(merged_lcf.keys()),
+    })
+
+
+def cmd_generate_workflow(args):
+    """输出 job 配置摘要，供 Agent 生成 jobs/<id>/workflow.md。
+
+    此命令本身不生成 workflow.md —— 它输出 job 配置摘要 + 指引，
+    Agent 根据摘要和 docs/workflow-generation.md 的裁剪规则，
+    选择正确的模板骨架并填写具体值后写入目标路径。
+    """
+    job = job_schema.load_job(args.id)
+    job_dir_path = job_schema.job_dir(args.id)
+    workflow_path = os.path.join(job_dir_path, "workflow.md")
+    already_exists = os.path.exists(workflow_path)
+    task_type = job.get("task_type", "signal_monitor")
+    cooldown_days = int(job.get("cooldown_days", 7 if task_type == "signal_monitor" else 0))
+    analysis_hook = job.get("analysis_hook") or {}
+    notification = job.get("notification") or {}
+    rh = job.get("result_handler") or {}
+    _emit({
+        "ok": True,
+        "id": args.id,
+        "workflow_target_path": os.path.relpath(workflow_path, SKILL_ROOT).replace("\\", "/"),
+        "already_exists": already_exists,
+        "task_type": task_type,
+        "name": job.get("name", args.id),
+        "cooldown_days": cooldown_days,
+        "analysis_hook_enabled": analysis_hook.get("enabled", False),
+        "analysis_hook_framework_doc": analysis_hook.get("framework_doc", ""),
+        "push_when": notification.get("push_when", "triggered_only"),
+        "has_references": bool((job.get("context") or {}).get("references")),
+        "has_run_sop": bool(((job.get("context") or {}).get("run_sop") or "").strip()),
+        "report_mode": (job.get("report") or {}).get("report_mode", "overwrite"),
+        "job_summary": {
+            "formulas_count": len(job.get("formulas") or (job.get("signal") or {}).get("formulas") or []),
+            "display_fields": (job.get("signal") or {}).get("display_fields") or [],
+            "trigger_formula": (job.get("signal") or {}).get("trigger_formula", ""),
+            "result_formula": rh.get("result_formula", ""),
+            "value_column_labels": [vc.get("label", "") for vc in rh.get("value_columns") or []],
+        },
+        "instruction": (
+            "请参考 docs/workflow-generation.md 的裁剪规则，"
+            "根据以上 job 配置，选择对应的模板骨架（templates/workflow_stock_picker.md "
+            "或 templates/workflow_signal_monitor.md），填写具体值后生成 workflow.md，"
+            "写入 workflow_target_path 指定的路径。"
+        ),
+    })
+
+
 def cmd_reset_cooldown(args):
     job = job_schema.load_job(args.id)
     state_dir = _state_dir(args.id)
@@ -743,6 +978,12 @@ def build_parser():
     sp = sub.add_parser("reset-cooldown"); sp.add_argument("id")
     sp.add_argument("--ticker"); sp.add_argument("--all", action="store_true")
     sp.set_defaults(func=cmd_reset_cooldown)
+
+    # ── 执行态专用 ───────────────────────────────────────────────────
+    sp = sub.add_parser("run-formulas"); sp.add_argument("id"); sp.set_defaults(func=cmd_run_formulas)
+
+    # ── workflow.md 生成辅助 ──────────────────────────────────────────
+    sp = sub.add_parser("generate-workflow"); sp.add_argument("id"); sp.set_defaults(func=cmd_generate_workflow)
 
     sp = sub.add_parser("pause"); sp.add_argument("id"); sp.set_defaults(func=cmd_pause)
     sp = sub.add_parser("resume"); sp.add_argument("id"); sp.set_defaults(func=cmd_resume)

@@ -24,11 +24,38 @@ metadata:
 
 ---
 
+## 状态模型
+
+Skill 按**使用场景**分三态，不同态有不同 SOP 和工具约束：
+
+| 状态 | 触发方式 | quant-buddy-skill | 公式执行方式 | 核心文档 |
+|------|----------|:-----------------:|---|---|
+| **创建态** | 对话（用户请求） | ✅ 可用 | MCP `runMultiFormulaBatch`（公式设计/验证） | `SKILL.md` + task SOP |
+| **执行态** | schtasks → `_run.bat` → `claude -p` | ❌ 禁止 | `cli.py run-formulas`（直连 HTTP） | `jobs/<id>/workflow.md` |
+| **管理态** | 对话（用户请求） | ❌ 不需要 | 无公式执行 | `SKILL.md` + CLI |
+
+### 创建态
+对话场景下的任意操作：创建新 job、修改公式、配置调度、生成/更新 workflow.md。
+**quant-buddy-skill 可用**，负责生成、验证公式。  
+创建流程末尾（`apply-schedule` 之前）必须调 `cli.py generate-workflow <id>` 并生成 `jobs/<id>/workflow.md`。
+
+### 执行态
+`_run.bat` 由 schtasks 触发后启动的 `claude -p` 单次调用。  
+**只读 `jobs/<id>/workflow.md`**，workflow.md 是此任务的唯一 SOP。  
+**严禁调用 quant-buddy-skill 或 runMultiFormulaBatch 执行公式**——公式通过 `cli.py run-formulas` 直连 HTTP 完成，Claude 全程在场、读取结果 JSON、掌控错误处理。
+
+### 管理态
+对话中用 CLI 管理 job 生命周期：list / show / pause / resume / diagnose / history / rollback 等。  
+无公式执行，无需 quant-buddy-skill。
+
+---
+
 ## 详细文档（docs/）
 
 | 文档 | 内容 |
 |------|------|
-| [docs/agent-runtime-flow.md](docs/agent-runtime-flow.md) | **Agent 运行时 13 步流**（schtasks 触发后必读）+ Agent 严格约束 |
+| [docs/workflow-generation.md](docs/workflow-generation.md) | **workflow.md 裁剪规则**（创建态必读）：如何按 job 配置生成执行 SOP |
+| [docs/agent-runtime-flow.md](docs/agent-runtime-flow.md) | 通用 13 步流（创建态参考 / 立即试跑用）；执行态实际按 `jobs/<id>/workflow.md` |
 | [docs/signal-monitor-sop.md](docs/signal-monitor-sop.md) | signal_monitor SOP：触发判定、冷静期、**资产池文件管理规则**、信号 presets、完整工作流、analysis_hook |
 | [docs/stock-picker-sop.md](docs/stock-picker-sop.md) | stock_picker SOP：result_handler 字段、begin_date 占位符、工作流 D/E |
 | [docs/cli-reference.md](docs/cli-reference.md) | CLI 速查表（含 6 个 agent-path 原语）、工作流 A-G、常见问题排查 |
@@ -79,7 +106,8 @@ metadata:
 }
 ```
 
-**运行时架构（v2 — agent path）**：schtasks 触发 `_run.bat` → 启动 `claude -p` → agent 按 [docs/agent-runtime-flow.md](docs/agent-runtime-flow.md) 的 13 步流跑完 job：读 job → load-assets → load-cooldown → 调 quant-buddy-skill 的 `runMultiFormulaBatch` 跑公式 → 末日值/TopN → 触发判定 →（有触发时 WebSearch 归因）→ 写 markdown 报告 → push 到企微 → push 成功后才 mark-triggered。CLI 只提供原语命令（`load-assets` / `load-cooldown` / `mark-triggered` / `push` / `save-result` / `save-report`），不再提供 `run` / `trigger` 这种「一键全跑」的 Python 包装 —— 老路径会绕过 quant-buddy-skill 的 SOP 和 agent 的归因能力。
+**运行时架构（v3 — workflow.md 执行态）**：schtasks 触发 `_run.bat` → 启动 `claude -p` → agent 只读 `jobs/<id>/workflow.md`（按 job 类型裁剪的精简 SOP）→ 调 `cli.py run-formulas` 直连 HTTP 跑公式（Claude 全程在场、读取 JSON 结果、掌控错误处理）→ 末日值/TopN → 触发判定 →（有触发时 WebSearch 归因）→ 写 markdown 报告 → push 到企微 → push 成功后才 mark-triggered。  
+**⚠️ 执行态严禁使用 quant-buddy-skill**；创建态可用 quant-buddy-skill 生成和验证公式。
 
 ---
 
@@ -213,23 +241,26 @@ python scripts/cli.py apply-schedule <job_id>
    ├─ 改字段               → cli set <id> <jsonpath> <value>   （写入前自动备份）
    ├─ 加 job（有公式，有打包打法）→ cli add <id> --from bundle:<name>
    │                          自动复制资产池/模板/参考资料/SOP，只需再 set webhook + cron
+   │                          → 创建完成后调 cli generate-workflow <id>，生成 workflow.md
+   │                          → 最后 cli apply-schedule <id>
    ├─ 加 job（有公式）     → cli add <id> --task-type <type> --from preset:<name>
    │                          或 --formulas-file <formulas.json>
-   │                          [--template-file 报告模板.md]（复制到 jobs/<id>/templates/）
-   │                          [--reference-files 框架.md,背景.md]（复制到 jobs/<id>/references/）
-   │                          [--run-sop "额外执行约束"]（写入 job.context.run_sop）
+   │                          → 创建完成后调 cli generate-workflow <id>，生成 workflow.md
+   │                          → 最后 cli apply-schedule <id>
    ├─ 加 job（没有公式）   → cli add <id> --task-type <type> --scaffold
-   │                          [--template-file ...] [--reference-files ...] [--run-sop ...]
    │                          → 对话里调 quant-buddy-skill 生成公式
    │                          → cli set <id> formulas '[...]'
+   │                          → cli generate-workflow <id>，生成 workflow.md
+   │                          → cli apply-schedule <id>
+   ├─ 更新 workflow.md     → cli generate-workflow <id> → 重新生成 jobs/<id>/workflow.md
    ├─ 删 job               → cli delete <id> --yes
    ├─ 暂停/恢复            → cli pause <id> / resume <id>
-   ├─ 改公式后             → cli validate <id>
+   ├─ 改公式后             → cli validate <id> → 重新生成 workflow.md → cli apply-schedule <id>
    └─ 改时间               → cli set schedule.cron/time ... → cli apply-schedule <id>
 
 定时触发时（_run.bat → claude -p）：
-   按 docs/agent-runtime-flow.md 的 13 步流执行（load-assets → 跑公式 → 触发判定
-   → 归因 → 写报告 → push → mark-triggered → save-report → save-result）
+   只读 jobs/<id>/workflow.md，严格按其步骤执行。
+   ⚠️ 禁止调用 quant-buddy-skill 或 runMultiFormulaBatch——公式由 cli run-formulas 完成。
 ```
 
 所有命令统一入口：

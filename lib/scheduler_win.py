@@ -150,12 +150,9 @@ def _runner_path(job_id: str) -> str:
 
     prompt = (
         f"运行 scheduled-task 任务 {job_id}。"
-        f"严格读取并执行 docs/agent-runtime-flow.md 的 13 步运行流（含步骤 9.5 生成 _pending_push.md）："
-        f"读 job → 加载资产 → 加载冷静期 → 调 quant-buddy-skill 的 runMultiFormulaBatch 跑公式 → "
-        f"触发判定 → （有触发时调用归因 hook）→ 写 markdown 报告到 _pending_report.md → "
-        f"生成精简推送稿到 _pending_push.md → push 精简稿到企微 → push 成功后 mark-triggered → "
-        f"save-report → save-result。"
-        f"不可跳步、不可并行步骤 5–9；推送失败禁止调 mark-triggered；全部步骤必须在本次调用内完成。"
+        f"读取 jobs/{job_id}/workflow.md，严格按其中的步骤逐一执行，workflow.md 即为本次唯一 SOP。"
+        f"⚠️ 严禁通过 quant-buddy-skill 或 runMultiFormulaBatch 执行公式——"
+        f"公式计算已由步骤中的 cli.py run-formulas 完成，禁止绕过。"
         + (f" {state_hint}" if state_hint else "")
     )
     content = (

@@ -115,7 +115,12 @@ python scripts/cli.py set <id> report.report_mode incremental
 # 5. 验证（schema 校验，不跑公式）
 python scripts/cli.py validate <id>
 
-# 6. 注册 Windows 计划任务
+# 6. 生成执行态 SOP（必须在 apply-schedule 之前完成）
+python scripts/cli.py generate-workflow <id>
+# → 按输出的 instruction 和 workflow_target_path，参考 docs/workflow-generation.md
+#   生成 jobs/<id>/workflow.md（stock_picker 裁剪为 6 步，无归因无冷静期）
+
+# 7. 注册 Windows 计划任务
 python scripts/cli.py apply-schedule <id>
 # 立即试跑：在对话里让 agent 按 docs/agent-runtime-flow.md 走 13 步
 ```
@@ -141,7 +146,11 @@ python scripts/cli.py set <id> result_handler \
 # 5. 校验
 python scripts/cli.py validate <id>
 
-# 6. 走场景 D 步骤 2-6
+# 6. 生成执行态 SOP
+python scripts/cli.py generate-workflow <id>
+# → 参考 docs/workflow-generation.md，生成 jobs/<id>/workflow.md
+
+# 7. 走场景 D 步骤 2（set webhook）、步骤 6-7（generate-workflow + apply-schedule）
 ```
 
 ---
@@ -150,6 +159,7 @@ python scripts/cli.py validate <id>
 
 - stock_picker **无 `asset_source` 字段**，不需要资产池文件
 - 公式中的字段名（如 `A股市盈率（PE, TTM）〔估值数据〕`）须与 quant-buddy confirmDataMulti 实测结果一致，全角括号/中文逗号等**原文保留**
-- 运行时是 agent：schtasks → `_run.bat` → `claude -p` → 按 [agent-runtime-flow.md](./agent-runtime-flow.md) 的 13 步流执行。stock_picker 通常不需要归因（无 triggered 概念，直接 TopN 推快照），步骤 8 跳过即可。
-- 公式分批：超过 10 条时 agent 必须切批跑，共用同一 task_id、`force_reusable_array=true`，详见 quant-buddy-skill 的 `tools/run_multi_formula.md`。
+- 运行时（执行态）：schtasks → `_run.bat` → `claude -p` → **只读 `jobs/<id>/workflow.md`**，按 workflow.md 步骤执行，不再读 agent-runtime-flow.md
+- **执行态公式执行方式**：`cli.py run-formulas <id>`（直连 HTTP），不走 MCP / quant-buddy-skill
+- 公式分批（`run-formulas` 内部已处理，不需要 agent 手动切批）
 - `push_when` 建议设为 `always`（每次都推快照），不同于 signal_monitor 的 `triggered_only`

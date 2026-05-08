@@ -1,5 +1,12 @@
 # agent-runtime-flow — schtasks 触发后 Agent 的标准运行流
 
+> ⚠️ **创建态参考文档** — 此文档描述通用 13 步流，适用于：
+> 1. **对话里"立即跑一次"**（非 schtasks 触发）
+> 2. **创建态**理解完整流程
+>
+> **schtasks 定时触发的执行态**不读本文档——执行态 claude 只读 `jobs/<id>/workflow.md`。  
+> 若还没有 `workflow.md`，先在对话里执行 `cli.py generate-workflow <id>` 生成它。
+
 `_run.bat` 由 schtasks 启动后会调起 `claude -p "运行 scheduled-task 任务 <id> ..."`。
 Agent 在**单次**调用内必须按下面 13 步顺序跑完整个 job，不允许跳步、不允许把 5–9 并行化。
 
