@@ -13,6 +13,24 @@ from typing import Any, Dict, List, Optional, Tuple
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(SKILL_ROOT, "jobs")
+
+# When SKILL_ROOT is inside ~/.claude, Claude cannot write to those paths (sensitive-file
+# protection, even under --permission-mode bypassPermissions).
+# `SCHEDULED_TASK_DATA_ROOT` env var (set by scheduler_win.py when needed) redirects all
+# run-time WRITE paths (state/, output/reports/, _pending_*.md) to a safe location outside
+# ~/.claude.  Job configs (job.json) remain in JOBS_DIR and are read-only during a run.
+_DATA_ROOT = os.environ.get("SCHEDULED_TASK_DATA_ROOT", "").strip()
+
+
+def data_dir(job_id: str) -> str:
+    """Return the read-write data directory for a job.
+
+    Normally identical to job_dir(). When SCHEDULED_TASK_DATA_ROOT is set (i.e. the skill
+    lives inside ~/.claude), returns a path outside ~/.claude so Claude can write freely.
+    """
+    if _DATA_ROOT:
+        return os.path.join(_DATA_ROOT, job_id)
+    return job_dir(job_id)
 REGISTRY_FILE = os.path.join(JOBS_DIR, "registry.json")
 HISTORY_KEEP = 20
 

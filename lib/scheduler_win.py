@@ -95,6 +95,23 @@ def _find_claude_exe() -> str:
     )
 
 
+def _get_safe_data_root() -> Optional[str]:
+    """Return a data root outside ~/.claude when SKILL_ROOT is inside it.
+
+    Claude Code's --permission-mode bypassPermissions does NOT bypass the hardcoded
+    sensitive-file protection for ~/.claude/.  If the skill lives there, all run-time
+    writes (state/, output/, _pending_*.md) must go to a safe directory outside ~/.claude.
+    Returns None when SKILL_ROOT is already outside ~/.claude (normal case).
+    """
+    claude_dir = os.path.normcase(os.path.join(os.path.expanduser("~"), ".claude"))
+    if os.path.normcase(SKILL_ROOT).startswith(claude_dir):
+        local_appdata = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local"
+        )
+        return os.path.join(local_appdata, "scheduled-task-data")
+    return None
+
+
 def _runner_path(job_id: str) -> str:
     """每个 job 生成一个 _run.bat —— 启动 claude agent，让其按 SKILL.md 流程跑一次。
 
@@ -105,10 +122,32 @@ def _runner_path(job_id: str) -> str:
     runner_dir = os.path.join(SKILL_ROOT, "jobs", job_id)
     os.makedirs(runner_dir, exist_ok=True)
     runner = os.path.join(runner_dir, "_run.bat")
-    log_dir = os.path.join(runner_dir, "state", "logs").replace("/", "\\")
+
+    # Safe data root: None when already outside ~/.claude, a path under AppData\Local otherwise.
+    safe_data_root = _get_safe_data_root()
+    if safe_data_root:
+        log_dir = os.path.join(safe_data_root, job_id, "state", "logs").replace("/", "\\")
+    else:
+        log_dir = os.path.join(runner_dir, "state", "logs").replace("/", "\\")
+
     claude_exe = _find_claude_exe()
     # cd 到 SKILL_ROOT 使相对路径（jobs/、output/、docs/）一致；agent 仍能找到 user-scope skill
     cwd = SKILL_ROOT.replace("/", "\\")
+
+    # Build the state-root hint injected into the prompt only when a redirect is active.
+    if safe_data_root:
+        data_root_win = safe_data_root.replace("/", "\\")
+        state_hint = (
+            f"【重要】本次运行时所有写入操作（_pending_report.md、_pending_push.md、"
+            f"state/ 目录下的所有文件、output/ 目录）必须使用绝对路径 "
+            f"{data_root_win}\\{job_id}\\ 作为数据根目录，"
+            f"不得写入 {cwd}\\jobs\\{job_id}\\（该路径受 Claude 敏感文件保护）。"
+        )
+        data_root_env = f'set "SCHEDULED_TASK_DATA_ROOT={data_root_win}"\r\n'
+    else:
+        state_hint = ""
+        data_root_env = ""
+
     prompt = (
         f"运行 scheduled-task 任务 {job_id}。"
         f"严格读取并执行 docs/agent-runtime-flow.md 的 13 步运行流（含步骤 9.5 生成 _pending_push.md）："
@@ -117,12 +156,14 @@ def _runner_path(job_id: str) -> str:
         f"生成精简推送稿到 _pending_push.md → push 精简稿到企微 → push 成功后 mark-triggered → "
         f"save-report → save-result。"
         f"不可跳步、不可并行步骤 5–9；推送失败禁止调 mark-triggered；全部步骤必须在本次调用内完成。"
+        + (f" {state_hint}" if state_hint else "")
     )
     content = (
         "@echo off\r\n"
         "setlocal\r\n"
         f'set "LOG_DIR={log_dir}"\r\n'
         f'set "CLAUDE_EXE={claude_exe}"\r\n'
+        + data_root_env +
         f'if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"\r\n'
         f'for /f "tokens=2 delims==" %%I in (\'wmic os get localdatetime /value 2^>nul ^| find "="\') do set DT=%%I\r\n'
         f'set "DAY=%DT:~0,8%"\r\n'
@@ -130,7 +171,7 @@ def _runner_path(job_id: str) -> str:
         f'echo. >> "%LOG%"\r\n'
         f'echo ========== %DATE% %TIME% START ========== >> "%LOG%"\r\n'
         f'cd /d "{cwd}"\r\n'
-        f'call "%CLAUDE_EXE%" -p "{prompt}" --permission-mode bypassPermissions --output-format text < NUL >> "%LOG%" 2>&1\r\n'
+        f'call "%CLAUDE_EXE%" -p "{prompt}" --permission-mode bypassPermissions --allowedTools "mcp__*" --output-format text < NUL >> "%LOG%" 2>&1\r\n'
         f'set "RC=%ERRORLEVEL%"\r\n'
         f'echo ========== %DATE% %TIME% END (exit=%RC%) ========== >> "%LOG%"\r\n'
         f'endlocal & exit /b %RC%\r\n'

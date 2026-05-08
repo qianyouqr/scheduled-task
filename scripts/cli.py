@@ -65,7 +65,7 @@ def _err(msg: str, **extra):
 
 
 def _state_dir(job_id: str) -> str:
-    return os.path.join(job_schema.job_dir(job_id), "state")
+    return os.path.join(job_schema.data_dir(job_id), "state")
 
 
 def _last_result_path(job_id: str) -> str:
@@ -521,8 +521,7 @@ def cmd_save_report(args):
     job = job_schema.load_job(args.id)
     mode = (job.get("report") or {}).get("report_mode", "overwrite")
     out_dir_rel = (job.get("report") or {}).get("output_dir", "output/reports")
-    job_dir = os.path.join(SKILL_ROOT, "jobs", args.id)
-    out_dir = os.path.normpath(os.path.join(job_dir, out_dir_rel))
+    out_dir = os.path.normpath(os.path.join(job_schema.data_dir(args.id), out_dir_rel))
     os.makedirs(out_dir, exist_ok=True)
     with open(args.file, "r", encoding="utf-8") as f:
         text = f.read()
