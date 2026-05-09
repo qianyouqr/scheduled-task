@@ -3,7 +3,7 @@
 > 适用任务：`{JOB_ID}` | 类型：signal_monitor | 冷静期：{COOLDOWN_DAYS} 天 | push_when: {PUSH_WHEN} | 归因：{ANALYSIS_HOOK_ENABLED}
 
 ⚠️ **执行约束（严格遵守）**
-- 禁止调用 quant-buddy-skill 或 runMultiFormulaBatch 执行公式——公式由步骤 1 的 `cli.py run-formulas` 完成
+- 禁止调用 quant-buddy-skill 或 runMultiFormulaBatch 执行公式——公式由步骤 1 的 `cli.py run-formulas` 计算，数据由步骤 2 的 `cli.py read-results` 读取
 - 禁止读取 docs/agent-runtime-flow.md（那是创建态参考文档）
 - 步骤 1 返回 errors 时：错误数 < 公式数的一半则继续；否则写日志后终止
 - 推送失败（push.ok != true）时：禁止调 mark-triggered，终止后续步骤
@@ -18,7 +18,7 @@ run_start_time = 当前时间（YYYY-MM-DD HH:MM:SS）
 
 ---
 
-## 步骤 1 — 跑公式 & 获取触发结果
+## 步骤 1 — 跑公式
 
 ```bash
 python {SKILL_ROOT}/scripts/cli.py run-formulas {JOB_ID}
@@ -27,17 +27,31 @@ python {SKILL_ROOT}/scripts/cli.py run-formulas {JOB_ID}
 从返回 JSON 中读取：
 - `run_start_time`：本次执行时间（覆盖步骤 0 的值）
 - `today`：数据日期
-- `triggered[]`：经冷静期过滤后的新触发 ticker 列表
-- `cooled_down[]`：被冷静期跳过的 ticker 列表
-- `errors[]`：数据异常列表
-- `last_column_full_keys`：调试用
+- `formula_id_map_keys`：已完成计算的公式名列表（调试用）
+- `errors[]`：公式执行异常列表
 
-**错误处理**：若 `ok=false` 则写日志后终止。若 `errors` 非空，记录但继续。
+**错误处理**：若 `ok=false` 则写日志后终止。若 `errors` 非空，错误数 < 公式数一半则继续。
 
 ---
 
-<!-- === 步骤 2（仅 analysis_hook.enabled=true 时保留） === -->
-## 步骤 2 — 归因（仅 triggered 非空 且 analysis_hook.enabled=true）
+## 步骤 2 — 读取结果
+
+```bash
+python {SKILL_ROOT}/scripts/cli.py read-results {JOB_ID}
+```
+
+从返回 JSON 中读取：
+- `triggered[]`：经冷静期过滤后的新触发 ticker 列表
+- `cooled_down[]`：被冷静期跳过的 ticker 列表
+- `errors[]`：数据读取异常列表
+- `last_column_full_keys`：调试用
+
+**错误处理**：若 `ok=false`，等待 5 秒后重试一次（公式已完成计算，无需重跑 run-formulas）；仍失败则写日志后终止。
+
+---
+
+<!-- === 步骤 3（仅 analysis_hook.enabled=true 时保留） === -->
+## 步骤 3 — 归因（仅 triggered 非空 且 analysis_hook.enabled=true）
 
 > 若 triggered 为空 或 analysis_hook.enabled=false，**跳过本步骤**。
 
@@ -52,7 +66,7 @@ python {SKILL_ROOT}/scripts/cli.py run-formulas {JOB_ID}
 
 ---
 
-## 步骤 3 — 写精简推送稿
+## 步骤 4 — 写精简推送稿
 
 将以下内容写入 `{DATA_ROOT}/{JOB_ID}/state/_pending_push.md`：
 
@@ -85,11 +99,11 @@ python {SKILL_ROOT}/scripts/cli.py run-formulas {JOB_ID}
 冷静期内 {M} 只：{ticker1名...}（最多 5 只，超过写"等 M 只"）
 ```
 
-**无触发 且 push_when = "triggered_only"**：**跳过步骤 4（不推送）**，直接执行步骤 5。
+**无触发 且 push_when = "triggered_only"**：**跳过步骤 5（不推送）**，直接执行步骤 6。
 
 ---
 
-## 步骤 4 — 写完整报告
+## 步骤 5 — 写完整报告
 
 将完整报告写入 `{DATA_ROOT}/{JOB_ID}/state/_pending_report.md`。
 
@@ -102,7 +116,7 @@ python {SKILL_ROOT}/scripts/cli.py run-formulas {JOB_ID}
 
 ---
 
-## 步骤 5 — 推送
+## 步骤 6 — 推送
 
 ```bash
 python {SKILL_ROOT}/scripts/cli.py push {JOB_ID} --report-file {DATA_ROOT}/{JOB_ID}/state/_pending_push.md
@@ -110,11 +124,11 @@ python {SKILL_ROOT}/scripts/cli.py push {JOB_ID} --report-file {DATA_ROOT}/{JOB_
 
 检查返回 `push.ok` 必须为 `true`，否则终止（禁止调 mark-triggered）。
 
-push_when = "triggered_only" 且 triggered 为空时，此步骤已在步骤 3 被跳过，视为正常流程继续。
+push_when = "triggered_only" 且 triggered 为空时，此步骤已在步骤 4 被跳过，视为正常流程继续。
 
 ---
 
-## 步骤 6 — mark-triggered（仅 push 成功后）
+## 步骤 7 — mark-triggered（仅 push 成功后）
 
 > 仅当 triggered 非空 且 push.ok = true 时执行。冷静期为 0 时也可跳过。
 
@@ -124,7 +138,7 @@ python {SKILL_ROOT}/scripts/cli.py mark-triggered {JOB_ID} --tickers {T1},{T2},.
 
 ---
 
-## 步骤 7 — 落盘报告
+## 步骤 8 — 落盘报告
 
 ```bash
 python {SKILL_ROOT}/scripts/cli.py save-report {JOB_ID} --file {DATA_ROOT}/{JOB_ID}/state/_pending_report.md
@@ -132,7 +146,7 @@ python {SKILL_ROOT}/scripts/cli.py save-report {JOB_ID} --file {DATA_ROOT}/{JOB_
 
 ---
 
-## 步骤 8 — 保存结果摘要
+## 步骤 9 — 保存结果摘要
 
 将以下 JSON 写入临时文件后调用：
 

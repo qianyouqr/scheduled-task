@@ -642,30 +642,178 @@ def cmd_run_formulas(args):
     if not formulas:
         _err(f"job {args.id} 无公式（formulas 为空）")
 
-    # 分批跑公式（单批 ≤10 条，共用 task_id，force_reusable_array=true）
+    # 分批跑公式（单批 ≤10 条，共用 task_id）
     BATCH_SIZE = 10
+    total_batches = (len(formulas) + BATCH_SIZE - 1) // BATCH_SIZE
     all_errors: list = []
-    all_results: list = []
-    merged_lcf: dict = {}  # last_column_full 合并
+    all_id_map: dict = {}  # {公式名: _id}，由 read-results 命令读取后调 read_data
+
+    def _leftname(f: str) -> str:
+        """提取公式左侧变量名：'Name = expr' → 'Name'。"""
+        return str(f).split("=", 1)[0].strip()
 
     for i in range(0, len(formulas), BATCH_SIZE):
         batch = formulas[i:i + BATCH_SIZE]
+        batch_idx = i // BATCH_SIZE
+        kw: dict = {}
+        if batch_idx < total_batches - 1:
+            # 多批时：把本批所有左侧变量名写入 force_reusable_array（string[]），
+            # 使服务端保留这些变量供后续批次引用。
+            # 单批时不传此参数（服务端默认全部复用）。
+            kw["force_reusable_array"] = [_leftname(f) for f in batch]
         try:
             result = api.run_multi_formula(
                 formulas=batch,
                 begin_date=int(begin_date),
                 task_id=task_id,
-                force_reusable_array=True,
                 use_minute_data=True,
+                **kw,
             )
         except Exception as e:
             all_errors.append({"batch_start": i, "error": f"{type(e).__name__}: {e}"})
             continue
+        # API 顶层 code=-1 时 _unwrap 不展开原始 dict，需显式检查
+        if result.get("code") == -1 or "error" in result:
+            err_msg = (result.get("error") or {}).get("message", str(result))
+            all_errors.append({"batch_start": i, "error": err_msg})
+            continue
         all_errors.extend(result.get("errors") or [])
-        all_results.extend(result.get("results") or [])
-        merged_lcf.update(result.get("last_column_full") or {})
+        # 收集 {公式名: _id}，供 read-results 命令使用
+        all_id_map.update(api.extract_obj_ids(result))
 
-    # 提取末日值 / 触发判定 / TopN 排序
+    # 把 _id map 和 task_id 持久化，read-results 命令读取后调 read_data 拿末日截面
+    formula_ids_path = os.path.join(state_dir, "_formula_ids.json")
+    os.makedirs(state_dir, exist_ok=True)
+    with open(formula_ids_path, "w", encoding="utf-8") as _f:
+        json.dump({
+            "job_id": args.id,
+            "task_id": task_id,
+            "begin_date": begin_date,
+            "today": today.strftime("%Y-%m-%d"),
+            "run_start_time": run_start_time,
+            "formula_id_map": all_id_map,
+        }, _f, ensure_ascii=False, indent=2)
+
+    _emit({
+        "ok": True,
+        "id": args.id,
+        "task_type": task_type,
+        "run_start_time": run_start_time,
+        "today": today.strftime("%Y-%m-%d"),
+        "begin_date": begin_date,
+        "task_id": task_id,
+        "formula_count": len(formulas),
+        "batch_count": (len(formulas) + BATCH_SIZE - 1) // BATCH_SIZE,
+        "formula_id_map_keys": list(all_id_map.keys()),
+        "errors": all_errors,
+        "formula_ids_saved_to": os.path.relpath(formula_ids_path, SKILL_ROOT).replace("\\", "/"),
+        "next_step": "run: cli.py read-results <id>",
+    })
+
+
+def cmd_read_results(args):
+    """读取 run-formulas 存储的 _id map，调 read_data(last_column_full) 拿末日截面，
+    完成触发判定 / TopN 排序，输出 triggered[]/selected[]。
+    若 read_data 失败，Claude 可不重跑公式，直接重试本命令。
+    """
+    job = job_schema.load_job(args.id)
+    task_type = job.get("task_type", "signal_monitor")
+    state_dir = _state_dir(args.id)
+
+    # 读取 run-formulas 存储的 _formula_ids.json
+    formula_ids_path = os.path.join(state_dir, "_formula_ids.json")
+    if not os.path.exists(formula_ids_path):
+        _err("找不到 _formula_ids.json，请先运行 cli.py run-formulas <id>")
+
+    with open(formula_ids_path, "r", encoding="utf-8") as _f:
+        fid_data = json.load(_f)
+
+    if fid_data.get("job_id") != args.id:
+        _err(
+            f"_formula_ids.json 属于 job '{fid_data.get('job_id')}'，"
+            f"与当前 id '{args.id}' 不符"
+        )
+
+    all_id_map: dict = fid_data.get("formula_id_map") or {}
+    task_id: str = fid_data.get("task_id", "")
+    today_str: str = fid_data.get("today", date.today().strftime("%Y-%m-%d"))
+    run_start_time: str = fid_data.get("run_start_time", "")
+
+    if not all_id_map:
+        _err("_formula_ids.json 中 formula_id_map 为空，公式可能全部执行失败，请重新运行 run-formulas")
+
+    # 初始化 API，复用 run-formulas 的 session
+    try:
+        from lib import quant_buddy
+        api = quant_buddy.get_api()
+        api._task_id = task_id
+    except Exception as e:
+        _err(f"quant_api 初始化失败: {type(e).__name__}: {e}")
+
+    # 确定需要读取的公式名
+    if task_type == "signal_monitor":
+        signal = job.get("signal") or {}
+        trigger_formula = signal.get("trigger_formula", "信号")
+        display_fields = signal.get("display_fields") or []
+        needed_names = [trigger_formula] + [f for f in display_fields if f != trigger_formula]
+    else:
+        rh = job.get("result_handler") or {}
+        result_formula = rh.get("result_formula", "")
+        value_columns = rh.get("value_columns") or []
+        vc_froms = [vc.get("from", "") for vc in value_columns if vc.get("from")]
+        needed_names = [result_formula] + [f for f in vc_froms if f != result_formula]
+
+    available_names = [n for n in needed_names if n in all_id_map]
+    missing_names = [n for n in needed_names if n not in all_id_map]
+
+    all_errors: list = []
+    merged_lcf: dict = {}  # {公式名: {tickers, values, names}}
+
+    # 批量调 read_data（每批 ≤10 个）
+    READ_BATCH = 10
+    id_to_name: dict = {all_id_map[n]: n for n in available_names}
+
+    for j in range(0, len(available_names), READ_BATCH):
+        batch_names = available_names[j:j + READ_BATCH]
+        batch_ids = [all_id_map[n] for n in batch_names]
+        try:
+            rd_result = api.read_data(
+                ids=batch_ids,
+                mode="last_column_full",
+                task_id=task_id,
+                max_items=1000,
+            )
+        except Exception as e:
+            all_errors.append({"read_batch_start": j, "error": f"{type(e).__name__}: {e}"})
+            continue
+        if rd_result.get("code") == -1 or "error" in rd_result:
+            err_msg = (rd_result.get("error") or {}).get("message", str(rd_result))
+            all_errors.append({"read_batch_start": j, "error": err_msg})
+            continue
+        for item in (rd_result.get("data") or []):
+            item_id = str(item.get("id") or item.get("_id") or "")
+            formula_name = id_to_name.get(item_id)
+            if not formula_name:
+                continue
+            lcf = item.get("last_column_full") or {}
+            values_list = lcf.get("values") or []
+            merged_lcf[formula_name] = {
+                "tickers": [v["asset"] for v in values_list],
+                "values":  [v["value"] for v in values_list],
+                "names":   [v.get("name", v["asset"]) for v in values_list],
+            }
+
+    # 加载冷静期（signal_monitor 专用）
+    today = date.fromisoformat(today_str)
+    cooldown_days = int(job.get("cooldown_days", 0))
+    cooled_tickers: list = []
+    if task_type == "signal_monitor" and cooldown_days > 0:
+        cd_state = cooldown.load_state(state_dir)
+        for ticker, last in cd_state.items():
+            if cooldown.is_cooled_down(last, today, cooldown_days):
+                cooled_tickers.append(ticker)
+
+    # 触发判定 / TopN 排序
     triggered: list = []
     cooled_down: list = list(cooled_tickers)
     selected: list = []
@@ -673,7 +821,7 @@ def cmd_run_formulas(args):
     if task_type == "signal_monitor":
         trigger_formula = (job.get("signal") or {}).get("trigger_formula", "信号")
         entry = merged_lcf.get(trigger_formula) or {}
-        tickers_l = entry.get("tickers") or entry.get("ticker_list") or []
+        tickers_l = entry.get("tickers") or []
         values_l = entry.get("values") or []
         cooled_set = set(cooled_tickers)
         for ticker, val in zip(tickers_l, values_l):
@@ -681,33 +829,34 @@ def cmd_run_formulas(args):
                 v = float(val) if val is not None else 0.0
             except (TypeError, ValueError):
                 v = 0.0
-            if v >= 0.5:
-                if ticker not in cooled_set:
-                    triggered.append(ticker)
+            if v >= 0.5 and ticker not in cooled_set:
+                triggered.append(ticker)
     else:
         rh = job.get("result_handler") or {}
         result_formula = rh.get("result_formula", "")
         entry = merged_lcf.get(result_formula) or {}
-        tickers_l = entry.get("tickers") or entry.get("ticker_list") or []
+        tickers_l = entry.get("tickers") or []
         values_l = entry.get("values") or []
+        names_l = entry.get("names") or []
         value_columns = rh.get("value_columns") or []
         candidates: list = []
-        for ticker, val in zip(tickers_l, values_l):
+        for idx_c, (ticker, val) in enumerate(zip(tickers_l, values_l)):
             try:
                 v = float(val) if val is not None else 0.0
             except (TypeError, ValueError):
                 v = 0.0
             if v != 0:
-                row: dict = {"ticker": ticker, result_formula: val}
+                name = names_l[idx_c] if idx_c < len(names_l) else ticker
+                row: dict = {"ticker": ticker, "name": name, result_formula: val}
                 for vc in value_columns:
                     vc_from = vc.get("from", "")
                     vc_label = vc.get("label", vc_from)
                     vc_entry = merged_lcf.get(vc_from) or {}
-                    vc_tickers = vc_entry.get("tickers") or vc_entry.get("ticker_list") or []
+                    vc_tickers = vc_entry.get("tickers") or []
                     vc_vals = vc_entry.get("values") or []
                     if ticker in vc_tickers:
-                        idx = vc_tickers.index(ticker)
-                        row[vc_label] = vc_vals[idx] if idx < len(vc_vals) else None
+                        vc_idx = vc_tickers.index(ticker)
+                        row[vc_label] = vc_vals[vc_idx] if vc_idx < len(vc_vals) else None
                     else:
                         row[vc_label] = None
                 candidates.append(row)
@@ -732,13 +881,10 @@ def cmd_run_formulas(args):
         "id": args.id,
         "task_type": task_type,
         "run_start_time": run_start_time,
-        "today": today.strftime("%Y-%m-%d"),
-        "begin_date": begin_date,
+        "today": today_str,
         "task_id": task_id,
-        "formula_count": len(formulas),
-        "batch_count": (len(formulas) + BATCH_SIZE - 1) // BATCH_SIZE,
         "errors": all_errors,
-        "results_count": len(all_results),
+        "missing_formula_ids": missing_names,
         # signal_monitor 结果（经冷静期过滤）
         "triggered": triggered,
         "cooled_down": cooled_down,
@@ -981,6 +1127,7 @@ def build_parser():
 
     # ── 执行态专用 ───────────────────────────────────────────────────
     sp = sub.add_parser("run-formulas"); sp.add_argument("id"); sp.set_defaults(func=cmd_run_formulas)
+    sp = sub.add_parser("read-results"); sp.add_argument("id"); sp.set_defaults(func=cmd_read_results)
 
     # ── workflow.md 生成辅助 ──────────────────────────────────────────
     sp = sub.add_parser("generate-workflow"); sp.add_argument("id"); sp.set_defaults(func=cmd_generate_workflow)

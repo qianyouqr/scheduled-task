@@ -61,16 +61,29 @@ python {SKILL_ROOT}/scripts/cli.py load-cooldown <id>
 ```
 然后拼成 `name = expression` 形式的字符串列表。`stock_picker` 的 `formulas` 已是字符串列表，直接透传。
 
-### 步骤 5 — 调 quant-buddy-skill 跑公式
-**强制使用** quant-buddy-skill 的 `runMultiFormulaBatch` 原生工具（**不要**自己 import quant_api，也**不要**调子进程）。
+### 步骤 5 — 跑公式（cli.py run-formulas）
 
-- **切批**：单批 ≤10 条公式（quant-buddy 服务端硬上限）。多于 10 条时分批，且**所有批次必须共用同一 task_id**，并设置 `force_reusable_array=true`，使后批可以引用前批生成的中间变量。
+> 此步骤仅适用于**对话里“立即跑一次”**的创建态场景。执行态（schtasks 触发）只读 `workflow.md`，步骤分割和报错逻辑以 workflow.md 为准。
+
+```bash
+python {SKILL_ROOT}/scripts/cli.py run-formulas <id>
+```
+
+`run-formulas` 内部完成：公式分批执行（单批≤10 条，共用 task_id），并将所有公式的 `{leftName: _id}` 映射存入 `state/_formula_ids.json`。从返回 JSON 读取 `formula_id_map_keys`（已计算公式列表）、`errors[]`。
+
+- **切批**：单批 ≤10 条公式（quant-buddy 服务端硬上限）。多于 10 条时分批，且**所有批次必须共用同一 task_id**；非最后批需将本批所有左侧变量名写入 `force_reusable_array`（**字符串数组**，如 `["变量A", "变量B"]`），使服务端保留这些变量供后续批次引用。最后一批（或只有一批）不传此参数。
 - **begin_date**：按 quant-buddy 的 `tools/run_multi_formula.md` 分层规则选；`signal_monitor` 取 `today - lookback_days * 1.4`，`stock_picker` 看 `runMultiFormula_args.begin_date`（如 `auto_minus_60d` ⇒ `today - 90`）。
 - **use_minute_data**：默认 `true`。
 
-收集所有批次的 `errors[]`、`results[]`、`last_column_full`。
+### 步骤 6 — 读取末日截面（cli.py read-results）
 
-### 步骤 6 — 提取末日值（signal_monitor）/ TopN（stock_picker）
+```bash
+python {SKILL_ROOT}/scripts/cli.py read-results <id>
+```
+
+`read-results` 读取 `state/_formula_ids.json`，批量调用 `read_data(mode=last_column_full)`，完成触发判定 / TopN 排序。从返回 JSON 读取 `triggered[]`（或 `selected[]`）、`errors[]`。
+
+若 `ok=false`，等 5 秒后重试一次（公式已计算完成，无需重跑步骤 5）。
 
 **signal_monitor**：
 - 找出 `signal.trigger_formula` 对应的结果块；`last_column_full.values[]` 是每个 ticker 的末日布尔/数值。

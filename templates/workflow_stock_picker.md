@@ -18,7 +18,7 @@ run_start_time = 当前时间（YYYY-MM-DD HH:MM:SS）
 
 ---
 
-## 步骤 1 — 跑公式 & 获取选股结果
+## 步骤 1 — 跑公式
 
 ```bash
 python {SKILL_ROOT}/scripts/cli.py run-formulas {JOB_ID}
@@ -27,15 +27,29 @@ python {SKILL_ROOT}/scripts/cli.py run-formulas {JOB_ID}
 从返回 JSON 中读取：
 - `run_start_time`：本次执行时间（覆盖步骤 0 的值）
 - `today`：数据日期
-- `selected[]`：入选 ticker 列表（含各 value_column 值），已按排序字段排好序
-- `errors[]`：数据异常列表
-- `last_column_full_keys`：调试用
+- `formula_id_map_keys`：已完成计算的公式名列表（调试用）
+- `errors[]`：公式执行异常列表
 
 **错误处理**：若 `ok=false` 则写日志后终止。若 `errors` 非空，记录但继续。
 
 ---
 
-## 步骤 2 — 写精简推送稿
+## 步骤 2 — 读取结果
+
+```bash
+python {SKILL_ROOT}/scripts/cli.py read-results {JOB_ID}
+```
+
+从返回 JSON 中读取：
+- `selected[]`：入选 ticker 列表（含 ticker/name 及各 value_column 值），已按排序字段排好序
+- `errors[]`：数据读取异常列表
+- `last_column_full_keys`：调试用
+
+**错误处理**：若 `ok=false`，等待 5 秒后重试一次（公式已完成计算，无需重跑 run-formulas）；仍失败则写日志后终止。
+
+---
+
+## 步骤 3 — 写精简推送稿
 
 将以下内容写入 `{DATA_ROOT}/{JOB_ID}/state/_pending_push.md`：
 
@@ -51,11 +65,11 @@ python {SKILL_ROOT}/scripts/cli.py run-formulas {JOB_ID}
 📄 完整报告已落盘
 ```
 
-若 `selected` 为空且 push_when = "triggered_only"，**跳过步骤 3-6，直接执行步骤 7**。
+若 `selected` 为空且 push_when = "triggered_only"，**跳过步骤 4-7，直接执行步骤 8**。
 
 ---
 
-## 步骤 3 — 写完整报告
+## 步骤 4 — 写完整报告
 
 将完整表格报告写入 `{DATA_ROOT}/{JOB_ID}/state/_pending_report.md`。
 
@@ -68,17 +82,17 @@ python {SKILL_ROOT}/scripts/cli.py run-formulas {JOB_ID}
 
 ---
 
-## 步骤 4 — 推送
+## 步骤 5 — 推送
 
 ```bash
 python {SKILL_ROOT}/scripts/cli.py push {JOB_ID} --report-file {DATA_ROOT}/{JOB_ID}/state/_pending_push.md
 ```
 
-检查返回 `push.ok` 必须为 `true`，否则终止（不执行步骤 5/6）。
+检查返回 `push.ok` 必须为 `true`，否则终止（不执行步骤 6/7）。
 
 ---
 
-## 步骤 5 — 落盘报告
+## 步骤 6 — 落盘报告
 
 ```bash
 python {SKILL_ROOT}/scripts/cli.py save-report {JOB_ID} --file {DATA_ROOT}/{JOB_ID}/state/_pending_report.md
@@ -86,7 +100,7 @@ python {SKILL_ROOT}/scripts/cli.py save-report {JOB_ID} --file {DATA_ROOT}/{JOB_
 
 ---
 
-## 步骤 6 — 保存结果摘要
+## 步骤 7 — 保存结果摘要
 
 将以下 JSON 写入临时文件后调用：
 

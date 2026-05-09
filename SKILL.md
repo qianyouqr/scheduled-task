@@ -171,7 +171,7 @@ python scripts/cli.py apply-schedule <job_id>
 对**全市场/指定板块**跑一组筛选排序公式 → 取 TopN 快照 → 每次都推。
 公式由 quant-buddy 生成，scheduled-task **原样透传**。
 
-> ⚠️ **公式分批约束（agent 必须遵守）**：quant-buddy 服务端单次公式数硬上限为 **10 条**。`formulas` 数组可以完整写入 job.json —— 但运行时 agent 必须按 quant-buddy-skill 的 `tools/run_multi_formula.md` 切批：每批 ≤10 条、共用同一 `task_id`、`force_reusable_array=true`，使后批可以引用前批生成的中间变量。
+> ⚠️ **公式分批约束（agent 必须遵守）**：quant-buddy 服务端单次公式数硬上限为 **10 条**。`formulas` 数组可以完整写入 job.json —— 但运行时 agent 必须按 quant-buddy-skill 的 `tools/run_multi_formula.md` 切批：每批 ≤10 条、共用同一 `task_id`；非最后批需传 `force_reusable_array=["变量名1", "变量名2", ...]`（本批所有左侧变量名的**字符串数组**），使服务端保留这些变量供后续批次引用；最后批（或只有一批）不传此参数。
 
 ```json
 {
